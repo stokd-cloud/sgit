@@ -39,7 +39,10 @@ pub use shove::{
     ConflictResolver, PushDecision, ShoveOptions,
 };
 pub use worktree_clean::{remove_worktree, run_clean_at, CleanSummary};
-pub use worktree_lease::{git_common_dir, sanitize_repo, stable_repo_bucket};
+pub use worktree_lease::{
+    find_local_repo_id, git_common_dir, legacy_path_repo_bucket, read_repo_id_file, repo_id_bucket,
+    sanitize_repo, stable_repo_bucket,
+};
 pub use worktree_pin::{
     discover_bare_repos, ensure_pin_and_hook, install_reference_transaction_hook,
     is_linked_worktree, pin_marker_path, reconcile, reference_transaction_script,
