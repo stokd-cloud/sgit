@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+# Crates land in Phase 1 extraction (W-EXTRACT). This file marks the public
+# workspace root so clones and install docs have a stable Cargo entrypoint.
+members = []
+
+[workspace.package]
+version = "0.2.2"
+edition = "2021"
+license = "MIT"
+authors = ["Stokd Team"]
+repository = "https://github.com/stokd-cloud/sgit"
