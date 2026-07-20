@@ -1,0 +1,24 @@
+[package]
+name = "sgit-core"
+version = "0.2.2"
+edition = "2021"
+description = "Generic git/repo/worktree library for sgit and stokd"
+authors = ["Stokd Team"]
+license = "MIT"
+
+[lib]
+name = "sgit_core"
+path = "src/lib.rs"
+
+# Match apps/cli: warnings are hard errors so scaffold stays clean.
+[lints.rust]
+warnings = "deny"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+dirs = "5"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
