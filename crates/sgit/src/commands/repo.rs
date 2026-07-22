@@ -751,6 +751,7 @@ fn apply_local_rename(
             other => die(format!("worktree move failed: {other:?}")),
         }
         repair_targets.push(WorktreeRepairTarget::healthy(to.clone()));
+        repoint_session_history(from, to);
     }
 
     println!(
@@ -775,7 +776,162 @@ fn apply_local_rename(
     }
 }
 
-pub fn run_rename(repo_spec: &str, new_repo_spec: &str) {
+// ── rename state reconciliation (idempotent) ─────────────────────────────────
+// AX-SGIT-RENAME-IDEMPOTENT-RECONCILER: detect current-vs-desired state for the
+// GitHub remote and the local layout, then apply only the missing deltas so a
+// rename is safe to re-run and "just works" when the remote is already renamed.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GithubRenameState {
+    /// New slug resolves and old is gone or redirects to it — already renamed.
+    AlreadyDone,
+    /// Only the old slug exists (same owner) — `gh repo rename`.
+    NeedsRename,
+    /// Only the old slug exists under a different owner — transfer (+ rename).
+    NeedsTransfer,
+    /// Both slugs resolve to DIFFERENT repositories — refuse.
+    Collision,
+    /// Neither slug resolves on GitHub — local-only rename.
+    NeitherExists,
+}
+
+/// Decide the GitHub-side action purely from the immutable numeric repo ids of
+/// the old and new slugs. GitHub keeps a redirect after a rename, so a resolved
+/// old id EQUAL to the new id means the rename already happened.
+fn github_rename_state(
+    old_id: Option<u64>,
+    new_id: Option<u64>,
+    owner_changed: bool,
+) -> GithubRenameState {
+    match (old_id, new_id) {
+        // Both resolve: equal id is a redirect (already renamed); different ids
+        // are two distinct repositories (a real collision).
+        (Some(oid), Some(nid)) => {
+            if oid == nid {
+                GithubRenameState::AlreadyDone
+            } else {
+                GithubRenameState::Collision
+            }
+        }
+        // Old gone, new resolves -> the rename already happened.
+        (None, Some(_)) => GithubRenameState::AlreadyDone,
+        // Only the old slug resolves -> rename (same owner) or transfer.
+        (Some(_), None) => {
+            if owner_changed {
+                GithubRenameState::NeedsTransfer
+            } else {
+                GithubRenameState::NeedsRename
+            }
+        }
+        (None, None) => GithubRenameState::NeitherExists,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalRenameState {
+    /// Old bare gone, new bare present — already relocated.
+    NoOp,
+    /// Old bare present, new absent — relocate.
+    Move,
+    /// Both bares present — refuse (never clobber).
+    Collision,
+    /// Neither bare present — nothing local to rename.
+    Missing,
+}
+
+fn local_rename_state(old_bare_exists: bool, new_bare_exists: bool) -> LocalRenameState {
+    match (old_bare_exists, new_bare_exists) {
+        (true, false) => LocalRenameState::Move,
+        (false, true) => LocalRenameState::NoOp,
+        (true, true) => LocalRenameState::Collision,
+        (false, false) => LocalRenameState::Missing,
+    }
+}
+
+/// The immutable numeric GitHub repo id for `owner/repo`, or `None` when it does
+/// not resolve (404) or `gh` is unavailable. A rename leaves a redirect, so the
+/// OLD slug still resolves — to the SAME id — after a completed rename.
+fn remote_repo_id(owner: &str, repo: &str) -> Option<u64> {
+    let out = Command::new("gh")
+        .args(["api", &format!("repos/{owner}/{repo}"), "--jq", ".id"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok()
+}
+
+/// Repoint every provider's session history from the old worktree path to the
+/// new one (idempotent — a re-run finds nothing at the old key). Never fails the
+/// rename: provider errors surface as warnings.
+fn repoint_session_history(from: &Path, to: &Path) {
+    let roots = sgit_core::session_history::StoreRoots::system();
+    for outcome in sgit_core::session_history::migrate_session_history(from, to, &roots) {
+        match &outcome.action {
+            sgit_core::session_history::ProviderAction::Relocated { detail } => {
+                println!("  history[{}]: {detail}", outcome.provider)
+            }
+            sgit_core::session_history::ProviderAction::Rewrote { items } => {
+                println!("  history[{}]: rewrote {items} record(s)", outcome.provider)
+            }
+            sgit_core::session_history::ProviderAction::Failed { error } => {
+                eprintln!("  warning: history[{}]: {error}", outcome.provider)
+            }
+            sgit_core::session_history::ProviderAction::Skipped { .. } => {}
+        }
+    }
+}
+
+fn describe_github_state(state: GithubRenameState) -> &'static str {
+    match state {
+        GithubRenameState::AlreadyDone => "already renamed on GitHub — skip",
+        GithubRenameState::NeedsRename => "will `gh repo rename`",
+        GithubRenameState::NeedsTransfer => "will transfer owner (+ rename)",
+        GithubRenameState::Collision => "COLLISION — refuse (distinct repos)",
+        GithubRenameState::NeitherExists => "neither slug on GitHub — local-only",
+    }
+}
+
+fn describe_local_state(state: LocalRenameState) -> &'static str {
+    match state {
+        LocalRenameState::Move => "relocate bare + worktrees",
+        LocalRenameState::NoOp => "already relocated — skip",
+        LocalRenameState::Collision => "COLLISION — destination bare exists",
+        LocalRenameState::Missing => "no local clone",
+    }
+}
+
+fn print_rename_plan(
+    old_owner: &str,
+    old_repo: &str,
+    new_owner: &str,
+    new_repo: &str,
+    gh_state: GithubRenameState,
+    local_state: LocalRenameState,
+    plan: &RenamePlan,
+) {
+    println!("DRY RUN: rename {old_owner}/{old_repo} -> {new_owner}/{new_repo}");
+    println!("  GitHub: {}", describe_github_state(gh_state));
+    println!("  Local:  {}", describe_local_state(local_state));
+    if local_state == LocalRenameState::Move {
+        println!(
+            "  Bare:   {} -> {}",
+            plan.bare_from.display(),
+            plan.bare_to.display()
+        );
+        for (from, to) in &plan.worktree_moves {
+            if from == to {
+                println!("  Worktree (in place): {}", to.display());
+            } else {
+                println!("  Worktree: {} -> {}", from.display(), to.display());
+            }
+        }
+    }
+    println!("No changes made (dry run).");
+}
+
+pub fn run_rename(repo_spec: &str, new_repo_spec: &str, dry_run: bool) {
     let (old_owner, old_repo) = parse_owner_repo(repo_spec);
     let (new_owner, new_repo) = parse_owner_repo(new_repo_spec);
 
@@ -784,96 +940,162 @@ pub fn run_rename(repo_spec: &str, new_repo_spec: &str) {
     }
 
     let cfg = load_cfg();
-    let worktrees = {
-        let old_layout = resolve_repo_layout(&cfg, &old_owner, &old_repo);
-        if !old_layout.bare_dir.exists() {
-            die(format!(
-                "no local bare clone for {old_owner}/{old_repo} at {}",
-                old_layout.bare_dir.display()
-            ));
-        }
-        list_linked_worktrees(&old_layout.bare_dir)
-    };
+    let old_layout = resolve_repo_layout(&cfg, &old_owner, &old_repo);
+    let new_layout = resolve_repo_layout(&cfg, &new_owner, &new_repo);
 
+    let old_bare_exists = old_layout.bare_dir.exists();
+    let new_bare_exists = new_layout.bare_dir.exists();
+    let local_state = local_rename_state(old_bare_exists, new_bare_exists);
+
+    // Worktrees to relocate come from whichever bare is present.
+    let worktrees = if old_bare_exists {
+        list_linked_worktrees(&old_layout.bare_dir)
+    } else if new_bare_exists {
+        list_linked_worktrees(&new_layout.bare_dir)
+    } else {
+        Vec::new()
+    };
     let plan = plan_repo_rename(&cfg, &old_owner, &old_repo, &new_owner, &new_repo, &worktrees);
 
-    if plan.bare_to.exists() {
+    // GitHub state via immutable repo ids (read-only probes; safe in dry-run).
+    let owner_changed = new_owner != old_owner;
+    let old_id = remote_repo_id(&old_owner, &old_repo);
+    let new_id = remote_repo_id(&new_owner, &new_repo);
+    let gh_state = github_rename_state(old_id, new_id, owner_changed);
+
+    if dry_run {
+        print_rename_plan(
+            &old_owner, &old_repo, &new_owner, &new_repo, gh_state, local_state, &plan,
+        );
+        return;
+    }
+
+    // Refuse genuine collisions before mutating anything.
+    if gh_state == GithubRenameState::Collision {
+        die(format!(
+            "GitHub collision: {old_owner}/{old_repo} and {new_owner}/{new_repo} resolve to different repositories"
+        ));
+    }
+    if local_state == LocalRenameState::Collision {
         die(format!(
             "destination bare clone already exists: {}",
-            plan.bare_to.display()
+            new_layout.bare_dir.display()
+        ));
+    }
+    let github_needed = matches!(
+        gh_state,
+        GithubRenameState::NeedsRename | GithubRenameState::NeedsTransfer
+    );
+    if local_state == LocalRenameState::Missing && !github_needed {
+        die(format!(
+            "nothing to do: no local bare for {old_owner}/{old_repo} at {}, and the remote is already at {new_owner}/{new_repo}",
+            old_layout.bare_dir.display()
         ));
     }
 
+    // ── GitHub side — only when the remote is not already at the target ──
     let mut did_mirror_fallback = false;
-    if plan.gh_transfer {
-        println!("Transferring {old_owner}/{old_repo} to {new_owner} on GitHub...");
-        let out = Command::new("gh")
-            .args([
-                "api",
-                "--method",
-                "POST",
-                &format!("repos/{old_owner}/{old_repo}/transfer"),
-                "-f",
-                &format!("new_owner={new_owner}"),
-            ])
-            .output()
-            .unwrap_or_else(|e| die(format!("failed to run gh api transfer: {e}")));
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let detail = if stdout.trim().is_empty() {
-                stderr.trim().to_string()
-            } else {
-                format!("{}\n{}", stderr.trim(), stdout.trim())
-            };
-            if transfer_blocked_needs_mirror_fallback(&detail) {
-                println!(
-                    "warning: GitHub blocked the transfer (repo was previously owned by {new_owner}); falling back to a history-preserving mirror copy."
-                );
-                mirror_copy_bare_to_new_remote(
-                    &plan.bare_from,
-                    &old_owner,
-                    &old_repo,
-                    &new_owner,
-                    &new_repo,
-                );
-                did_mirror_fallback = true;
-            } else {
-                die(format!("GitHub transfer failed: {detail}"));
+    match gh_state {
+        GithubRenameState::AlreadyDone => {
+            println!("GitHub: {new_owner}/{new_repo} already renamed; skipping GitHub.");
+        }
+        GithubRenameState::NeitherExists => {
+            println!(
+                "warning: neither {old_owner}/{old_repo} nor {new_owner}/{new_repo} resolves on GitHub; doing a local-only rename."
+            );
+        }
+        GithubRenameState::NeedsRename | GithubRenameState::NeedsTransfer => {
+            if plan.gh_transfer {
+                println!("Transferring {old_owner}/{old_repo} to {new_owner} on GitHub...");
+                let out = Command::new("gh")
+                    .args([
+                        "api",
+                        "--method",
+                        "POST",
+                        &format!("repos/{old_owner}/{old_repo}/transfer"),
+                        "-f",
+                        &format!("new_owner={new_owner}"),
+                    ])
+                    .output()
+                    .unwrap_or_else(|e| die(format!("failed to run gh api transfer: {e}")));
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let detail = if stdout.trim().is_empty() {
+                        stderr.trim().to_string()
+                    } else {
+                        format!("{}\n{}", stderr.trim(), stdout.trim())
+                    };
+                    if transfer_blocked_needs_mirror_fallback(&detail) {
+                        println!(
+                            "warning: GitHub blocked the transfer (repo was previously owned by {new_owner}); falling back to a history-preserving mirror copy."
+                        );
+                        mirror_copy_bare_to_new_remote(
+                            &plan.bare_from,
+                            &old_owner,
+                            &old_repo,
+                            &new_owner,
+                            &new_repo,
+                        );
+                        did_mirror_fallback = true;
+                    } else {
+                        die(format!("GitHub transfer failed: {detail}"));
+                    }
+                }
+            }
+            if plan.gh_rename && !did_mirror_fallback {
+                let rename_owner = if plan.gh_transfer {
+                    &new_owner
+                } else {
+                    &old_owner
+                };
+                println!("Renaming {rename_owner}/{old_repo} -> {new_repo} on GitHub...");
+                let out = Command::new("gh")
+                    .args([
+                        "repo",
+                        "rename",
+                        &new_repo,
+                        "--repo",
+                        &format!("{rename_owner}/{old_repo}"),
+                        "--yes",
+                    ])
+                    .output()
+                    .unwrap_or_else(|e| die(format!("failed to run gh repo rename: {e}")));
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let detail = if stdout.trim().is_empty() {
+                        stderr.trim().to_string()
+                    } else {
+                        format!("{}\n{}", stderr.trim(), stdout.trim())
+                    };
+                    die(format!("GitHub rename failed: {detail}"));
+                }
             }
         }
-    }
-    if plan.gh_rename && !did_mirror_fallback {
-        let rename_owner = if plan.gh_transfer {
-            &new_owner
-        } else {
-            &old_owner
-        };
-        println!("Renaming {rename_owner}/{old_repo} -> {new_repo} on GitHub...");
-        let out = Command::new("gh")
-            .args([
-                "repo",
-                "rename",
-                &new_repo,
-                "--repo",
-                &format!("{rename_owner}/{old_repo}"),
-                "--yes",
-            ])
-            .output()
-            .unwrap_or_else(|e| die(format!("failed to run gh repo rename: {e}")));
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let detail = if stdout.trim().is_empty() {
-                stderr.trim().to_string()
-            } else {
-                format!("{}\n{}", stderr.trim(), stdout.trim())
-            };
-            die(format!("GitHub rename failed: {detail}"));
-        }
+        GithubRenameState::Collision => unreachable!("collision refused above"),
     }
 
-    apply_local_rename(&plan, &old_owner, &old_repo, &new_owner, &new_repo);
+    // ── Local side — apply only the missing delta ──
+    match local_state {
+        LocalRenameState::Move => {
+            apply_local_rename(&plan, &old_owner, &old_repo, &new_owner, &new_repo);
+        }
+        LocalRenameState::NoOp => {
+            println!(
+                "Local bare already at {}; repointing origin only.",
+                new_layout.bare_dir.display()
+            );
+            let _ = run_git_dir(
+                &new_layout.bare_dir,
+                &["remote", "set-url", "origin", &plan.new_origin_url],
+            );
+        }
+        LocalRenameState::Missing => {
+            println!("No local clone to move.");
+        }
+        LocalRenameState::Collision => unreachable!("collision refused above"),
+    }
 }
 
 // Silence unused import warnings when helpers are only used in docs/tests.
@@ -936,5 +1158,42 @@ mod tests {
             "Repositories cannot be transferred to the original owner"
         ));
         assert!(!transfer_blocked_needs_mirror_fallback("HTTP 401"));
+    }
+
+    #[test]
+    fn github_rename_state_matrix() {
+        use GithubRenameState::*;
+        // New slug resolves, old gone -> already done.
+        assert_eq!(github_rename_state(None, Some(9), false), AlreadyDone);
+        // Old slug redirects to the SAME id as new -> already done.
+        assert_eq!(github_rename_state(Some(9), Some(9), false), AlreadyDone);
+        // Both resolve to DIFFERENT repos -> collision.
+        assert_eq!(github_rename_state(Some(1), Some(2), false), Collision);
+        // Only old exists -> rename (same owner) / transfer (owner changed).
+        assert_eq!(github_rename_state(Some(1), None, false), NeedsRename);
+        assert_eq!(github_rename_state(Some(1), None, true), NeedsTransfer);
+        // Neither exists on GitHub -> local-only.
+        assert_eq!(github_rename_state(None, None, false), NeitherExists);
+    }
+
+    #[test]
+    fn local_rename_state_matrix() {
+        use LocalRenameState::*;
+        assert_eq!(local_rename_state(true, false), Move);
+        assert_eq!(local_rename_state(false, true), NoOp);
+        assert_eq!(local_rename_state(true, true), Collision);
+        assert_eq!(local_rename_state(false, false), Missing);
+    }
+
+    #[test]
+    fn completed_rename_is_a_noop() {
+        // After a completed rename the OLD slug redirects to the SAME id and the
+        // new bare is the only local copy — both sides report "already done", so
+        // a re-run performs no GitHub call and no local move.
+        assert_eq!(
+            github_rename_state(Some(7), Some(7), false),
+            GithubRenameState::AlreadyDone
+        );
+        assert_eq!(local_rename_state(false, true), LocalRenameState::NoOp);
     }
 }

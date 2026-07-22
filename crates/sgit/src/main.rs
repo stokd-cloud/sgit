@@ -88,7 +88,7 @@ enum RepoCommands {
         #[arg(long)]
         public: bool,
     },
-    /// Rename on GitHub and relocate local bare + worktrees
+    /// Rename on GitHub and relocate local bare + worktrees (idempotent)
     Rename {
         /// Current owner/repo
         #[arg(value_name = "OWNER/REPO")]
@@ -96,6 +96,9 @@ enum RepoCommands {
         /// New owner/repo
         #[arg(value_name = "NEWOWNER/NEWREPO")]
         new_repo: String,
+        /// Print the planned deltas without changing anything
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Plan or apply migration to the canonical bare/worktree layout
     Migrate {
@@ -160,8 +163,13 @@ fn main() {
             },
         } => commands::repo::run_create(&repo, path.as_deref(), force, public),
         Commands::Repo {
-            command: RepoCommands::Rename { repo, new_repo },
-        } => commands::repo::run_rename(&repo, &new_repo),
+            command:
+                RepoCommands::Rename {
+                    repo,
+                    new_repo,
+                    dry_run,
+                },
+        } => commands::repo::run_rename(&repo, &new_repo, dry_run),
         Commands::Repo {
             command:
                 RepoCommands::Migrate {
