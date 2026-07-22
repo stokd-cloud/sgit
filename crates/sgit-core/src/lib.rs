@@ -8,6 +8,7 @@ mod config;
 pub mod layout;
 pub mod migrate_ops;
 mod repo_list;
+pub mod session_history;
 pub mod shove;
 pub mod worktree_clean;
 pub mod worktree_lease;
@@ -32,6 +33,9 @@ pub use layout::{
 pub use migrate_ops::{
     materialize_main_worktree, move_bare, move_worktree, ApplyStatus, UnsafeReason,
     WorktreeRepairTarget,
+};
+pub use session_history::{
+    migrate_session_history, ProviderAction, ProviderOutcome, StoreRoots,
 };
 pub use repo_list::{list_bare_repos, BareRepoEntry};
 pub use shove::{
