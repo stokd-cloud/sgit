@@ -4,9 +4,11 @@
 //! 1. `SGIT_CONFIG` — absolute or relative path to a YAML file
 //! 2. XDG — `$XDG_CONFIG_HOME/sgit/config.yaml` (default `~/.config/sgit/config.yaml`)
 //!    when that file exists
-//! 3. Continuity fallback — `~/.stokd/config.yaml` `repositories:` block
+//! 3. Continuity fallback — `~/.stokd/config.yaml` `git:` / `repositories:` block
 //!
 //! There is no code dependency on stokd; the fallback is only a filesystem path.
+//! Target keys are `git.bareRoot` / `git.root` / `git.worktree.primaryDirName`
+//! (VAL-GIT-002); legacy `repositories.*` remains dual-read for unmigrated files.
 
 use std::env;
 use std::fs;
@@ -17,7 +19,8 @@ use serde::{Deserialize, Serialize};
 /// Root layout for bare clones and worktrees.
 ///
 /// Field names match the existing stokd `repositories:` YAML keys so both tools
-/// can share `~/.stokd/config.yaml` without a schema fork.
+/// can share `~/.stokd/config.yaml` without a schema fork. Loading prefers
+/// target `git.*` keys when present (VAL-GIT-002).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RepositoriesConfig {
@@ -68,12 +71,32 @@ impl ConfigSource {
     }
 }
 
-/// Wrapper used when the YAML document is a full config with a `repositories:` key
-/// (as in `~/.stokd/config.yaml`). A bare `RepositoriesConfig` document is also accepted.
+/// Target `git.worktree` block (partial — sgit only needs naming/pin keys it uses).
+#[derive(Debug, Default, Deserialize)]
+struct GitWorktreeBlock {
+    #[serde(rename = "primaryDirName")]
+    primary_dir_name: Option<String>,
+}
+
+/// Target top-level `git:` block (VAL-GIT-002).
+#[derive(Debug, Default, Deserialize)]
+struct GitBlock {
+    #[serde(rename = "bareRoot")]
+    bare_root: Option<String>,
+    root: Option<String>,
+    #[serde(default)]
+    worktree: Option<GitWorktreeBlock>,
+}
+
+/// Wrapper used when the YAML document is a full config with a `repositories:`
+/// and/or `git:` key (as in `~/.stokd/config.yaml`). A bare `RepositoriesConfig`
+/// document is also accepted.
 #[derive(Debug, Deserialize)]
 struct ConfigDocument {
     #[serde(default)]
     repositories: Option<RepositoriesConfig>,
+    #[serde(default)]
+    git: Option<GitBlock>,
 }
 
 /// Resolve the config file path according to D002 precedence.
@@ -131,7 +154,7 @@ pub fn load_repositories_config() -> Result<(RepositoriesConfig, ConfigSource), 
     }
 }
 
-/// Parse a YAML file as either a full document with `repositories:` or a bare
+/// Parse a YAML file as either a full document with `git:` / `repositories:` or a bare
 /// repositories object.
 pub fn load_repositories_config_from_path(path: &Path) -> Result<RepositoriesConfig, String> {
     let text = fs::read_to_string(path)
@@ -141,15 +164,40 @@ pub fn load_repositories_config_from_path(path: &Path) -> Result<RepositoriesCon
 }
 
 fn parse_repositories_yaml(text: &str) -> Result<RepositoriesConfig, String> {
-    // Prefer a top-level `repositories:` document (stokd-shaped).
+    // Prefer a top-level document (stokd-shaped) with `git:` and/or `repositories:`.
     if let Ok(doc) = serde_yaml::from_str::<ConfigDocument>(text) {
-        if let Some(repos) = doc.repositories {
-            return Ok(repos);
+        if doc.git.is_some() || doc.repositories.is_some() {
+            return Ok(merge_git_and_repositories(doc.git, doc.repositories));
         }
     }
     // Bare repositories object (standalone SGIT_CONFIG / XDG fixtures).
     serde_yaml::from_str::<RepositoriesConfig>(text)
         .map_err(|e| format!("YAML parse error: {e}"))
+}
+
+/// Merge target `git.*` over legacy `repositories.*` (git wins when set).
+fn merge_git_and_repositories(
+    git: Option<GitBlock>,
+    repositories: Option<RepositoriesConfig>,
+) -> RepositoriesConfig {
+    let mut cfg = repositories.unwrap_or_default();
+    let Some(git) = git else {
+        return cfg;
+    };
+    if let Some(bare) = git.bare_root.filter(|s| !s.trim().is_empty()) {
+        cfg.bare_root = bare;
+    }
+    if let Some(root) = git.root.filter(|s| !s.trim().is_empty()) {
+        cfg.worktree_root = root;
+    }
+    if let Some(primary) = git
+        .worktree
+        .and_then(|w| w.primary_dir_name)
+        .filter(|s| !s.trim().is_empty())
+    {
+        cfg.main_worktree_name = primary;
+    }
+    cfg
 }
 
 #[cfg(test)]
@@ -186,5 +234,42 @@ root: /x/wt
         let yaml = "bareRoot: /b\nworktreeRoot: /w\n";
         let cfg = parse_repositories_yaml(yaml).unwrap();
         assert_eq!(cfg.worktree_root, "/w");
+    }
+
+    #[test]
+    fn prefers_git_block_over_repositories() {
+        // VAL-GIT-002: target git.* keys win over legacy repositories.*.
+        let yaml = r#"
+git:
+  bareRoot: /opt/dev
+  root: /opt/worktrees
+  worktree:
+    primaryDirName: "{branch}"
+repositories:
+  bareRoot: /legacy/bare
+  root: /legacy/wt
+  mainWorktreeName: "{repo}-main"
+"#;
+        let cfg = parse_repositories_yaml(yaml).unwrap();
+        assert_eq!(cfg.bare_root, "/opt/dev");
+        assert_eq!(cfg.worktree_root, "/opt/worktrees");
+        assert_eq!(cfg.main_worktree_name, "{branch}");
+    }
+
+    #[test]
+    fn parses_git_only_document() {
+        let yaml = r#"
+git:
+  bareRoot: /git/bare
+  root: /git/wt
+  worktree:
+    pin: true
+    primaryDirName: "{branch}"
+    taskDirName: "task/{hash}-{32}"
+"#;
+        let cfg = parse_repositories_yaml(yaml).unwrap();
+        assert_eq!(cfg.bare_root, "/git/bare");
+        assert_eq!(cfg.worktree_root, "/git/wt");
+        assert_eq!(cfg.main_worktree_name, "{branch}");
     }
 }
