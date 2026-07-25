@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sgit_core::{
-    bare_clone, create_worktree, list_bare_repos, list_linked_worktrees, load_repositories_config,
+    apply_submodule_checkout_for_repo, bare_clone, create_worktree, list_bare_repos,
+    list_linked_worktrees, load_repositories_config,
     move_bare, move_worktree, normalize_path, render_worktree_name_pattern, resolve_default_branch,
     resolve_repo_layout, run_git_dir, worktree_dir_for_branch, ApplyStatus, RepositoriesConfig,
     RepoLayout, WorktreeRepairTarget,
@@ -48,6 +49,26 @@ fn load_cfg() -> RepositoriesConfig {
 fn die(msg: impl AsRef<str>) -> ! {
     eprintln!("error: {}", msg.as_ref());
     std::process::exit(1);
+}
+
+/// Best-effort submodule materialization after a superproject worktree exists.
+/// Failures are warnings (never abort clone/open) so a missing bare for a heavy
+/// submodule does not block the parent repo.
+fn maybe_checkout_submodules(
+    cfg: &RepositoriesConfig,
+    worktree_dir: &Path,
+    owner: &str,
+    repo_name: &str,
+    quiet: bool,
+) {
+    match apply_submodule_checkout_for_repo(worktree_dir, cfg, owner, repo_name) {
+        Ok(()) => {}
+        Err(e) => {
+            if !quiet {
+                eprintln!("warning: submodule checkout: {e}");
+            }
+        }
+    }
 }
 
 // ── list ─────────────────────────────────────────────────────────────────────
@@ -146,6 +167,7 @@ pub fn run_clone(repo_spec: &str, json: bool) {
             }
             create_worktree(&layout.bare_dir, &layout.worktree_dir, &branch, true)
                 .unwrap_or_else(|e| die(e));
+            maybe_checkout_submodules(&cfg, &layout.worktree_dir, &owner, &repo_name, json);
             branch
         }
         RepoCloneAction::MaterializeWorktree => {
@@ -158,6 +180,7 @@ pub fn run_clone(repo_spec: &str, json: bool) {
             }
             create_worktree(&layout.bare_dir, &layout.worktree_dir, &branch, true)
                 .unwrap_or_else(|e| die(e));
+            maybe_checkout_submodules(&cfg, &layout.worktree_dir, &owner, &repo_name, json);
             branch
         }
         RepoCloneAction::ReportExisting => {
@@ -230,6 +253,7 @@ pub fn run_open(repo_spec: &str) {
             );
             create_worktree(&layout.bare_dir, &layout.worktree_dir, &branch, true)
                 .unwrap_or_else(|e| die(e));
+            maybe_checkout_submodules(&cfg, &layout.worktree_dir, &owner, &repo_name, false);
         }
         RepoOpenAction::MaterializeWorktreeThenOpen => {
             let branch = resolve_default_branch(&layout.bare_dir);
@@ -239,6 +263,7 @@ pub fn run_open(repo_spec: &str) {
             );
             create_worktree(&layout.bare_dir, &layout.worktree_dir, &branch, true)
                 .unwrap_or_else(|e| die(e));
+            maybe_checkout_submodules(&cfg, &layout.worktree_dir, &owner, &repo_name, false);
         }
         RepoOpenAction::OpenExisting => {
             println!(
@@ -916,6 +941,7 @@ mod tests {
             worktree_root: "/opt/worktrees".into(),
             main_worktree_name: "{branch}".into(),
             track_non_git_workspaces: false,
+            ..Default::default()
         };
         let wts = vec![
             PathBuf::from("/opt/worktrees/a/r/main"),

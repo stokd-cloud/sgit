@@ -9,6 +9,7 @@ pub mod layout;
 pub mod migrate_ops;
 mod repo_list;
 pub mod shove;
+pub mod submodule_checkout;
 pub mod worktree_clean;
 pub mod worktree_lease;
 pub mod worktree_pin;
@@ -21,6 +22,11 @@ pub use cd::{
 };
 pub use config::{
     load_repositories_config, resolve_config_path, ConfigSource, RepositoriesConfig,
+};
+pub use submodule_checkout::{
+    apply_submodule_checkout, apply_submodule_checkout_for_repo, normalize_repo_key,
+    normalize_repo_slug, resolve_submodule_checkout, SubmoduleCheckoutConfig,
+    SubmoduleCheckoutMode,
 };
 pub use layout::{
     bare_clone, bare_clone_from_url, bare_placeholder_branch, create_worktree,
