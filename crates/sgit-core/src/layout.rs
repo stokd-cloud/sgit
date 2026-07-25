@@ -399,8 +399,11 @@ pub fn git_ref_exists(bare_dir: &Path, refname: &str) -> bool {
             "--quiet",
             refname,
         ])
-        .status()
-        .map(|s| s.success())
+        // `.output()` (not `.status()`): the caller may probe a dir that is not
+        // actually a git repo, and git's `fatal:` stderr must never reach the
+        // user's terminal.
+        .output()
+        .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
