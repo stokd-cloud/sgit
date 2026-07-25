@@ -432,6 +432,7 @@ mod tests {
             worktree_root: "/opt/worktrees".into(),
             main_worktree_name: "{branch}".into(),
             track_non_git_workspaces: false,
+            ..Default::default()
         };
         let layout = resolve_repo_layout(&cfg, "stokd-cloud", "autores");
         assert_eq!(

@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::submodule_checkout::SubmoduleCheckoutConfig;
+
 /// Root layout for bare clones and worktrees.
 ///
 /// Field names match the existing stokd `repositories:` YAML keys so both tools
@@ -34,6 +36,11 @@ pub struct RepositoriesConfig {
     pub main_worktree_name: String,
     #[serde(rename = "trackNonGitWorkspaces")]
     pub track_non_git_workspaces: bool,
+    /// How submodules are materialized when a worktree is created.
+    /// Scalar (`worktree` | `none`) or per-repo map (`"@owner/repo": worktree`).
+    /// Default: `worktree`. See [`SubmoduleCheckoutConfig`].
+    #[serde(rename = "submoduleCheckout", default)]
+    pub submodule_checkout: SubmoduleCheckoutConfig,
 }
 
 impl Default for RepositoriesConfig {
@@ -43,6 +50,7 @@ impl Default for RepositoriesConfig {
             worktree_root: "/opt/worktrees".to_string(),
             main_worktree_name: "{branch}".to_string(),
             track_non_git_workspaces: false,
+            submodule_checkout: SubmoduleCheckoutConfig::default(),
         }
     }
 }
@@ -86,6 +94,8 @@ struct GitBlock {
     root: Option<String>,
     #[serde(default)]
     worktree: Option<GitWorktreeBlock>,
+    #[serde(rename = "submoduleCheckout", default)]
+    submodule_checkout: Option<SubmoduleCheckoutConfig>,
 }
 
 /// Wrapper used when the YAML document is a full config with a `repositories:`
@@ -197,6 +207,10 @@ fn merge_git_and_repositories(
     {
         cfg.main_worktree_name = primary;
     }
+    // git.submoduleCheckout wins when present (including explicit `none`).
+    if let Some(sc) = git.submodule_checkout {
+        cfg.submodule_checkout = sc;
+    }
     cfg
 }
 
@@ -271,5 +285,67 @@ git:
         assert_eq!(cfg.bare_root, "/git/bare");
         assert_eq!(cfg.worktree_root, "/git/wt");
         assert_eq!(cfg.main_worktree_name, "{branch}");
+    }
+
+    #[test]
+    fn parses_submodule_checkout_scalar_on_repositories() {
+        use crate::submodule_checkout::{SubmoduleCheckoutConfig, SubmoduleCheckoutMode};
+        let yaml = r#"
+repositories:
+  bareRoot: /b
+  root: /w
+  submoduleCheckout: none
+"#;
+        let cfg = parse_repositories_yaml(yaml).unwrap();
+        assert_eq!(
+            cfg.submodule_checkout,
+            SubmoduleCheckoutConfig::Global(SubmoduleCheckoutMode::None)
+        );
+    }
+
+    #[test]
+    fn parses_submodule_checkout_map_on_git_wins() {
+        use crate::submodule_checkout::{
+            resolve_submodule_checkout, SubmoduleCheckoutConfig, SubmoduleCheckoutMode,
+        };
+        let yaml = r#"
+git:
+  bareRoot: /opt/dev
+  root: /opt/worktrees
+  submoduleCheckout:
+    "@acme/widget": none
+    "@stokd-cloud/mono": worktree
+repositories:
+  submoduleCheckout: none
+"#;
+        let cfg = parse_repositories_yaml(yaml).unwrap();
+        assert_eq!(
+            resolve_submodule_checkout(&cfg.submodule_checkout, "acme", "widget"),
+            SubmoduleCheckoutMode::None
+        );
+        assert_eq!(
+            resolve_submodule_checkout(&cfg.submodule_checkout, "stokd-cloud", "mono"),
+            SubmoduleCheckoutMode::Worktree
+        );
+        // Map form from git (not scalar none from repositories).
+        assert!(matches!(
+            cfg.submodule_checkout,
+            SubmoduleCheckoutConfig::PerRepo(_)
+        ));
+    }
+
+    #[test]
+    fn submodule_checkout_defaults_to_worktree_when_absent() {
+        use crate::submodule_checkout::{SubmoduleCheckoutConfig, SubmoduleCheckoutMode};
+        let yaml = r#"
+repositories:
+  bareRoot: /b
+  root: /w
+"#;
+        let cfg = parse_repositories_yaml(yaml).unwrap();
+        assert_eq!(
+            cfg.submodule_checkout,
+            SubmoduleCheckoutConfig::Global(SubmoduleCheckoutMode::Worktree)
+        );
     }
 }
