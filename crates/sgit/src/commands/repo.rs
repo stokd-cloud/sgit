@@ -104,13 +104,38 @@ pub fn run_list(json: bool) {
         println!("No locally bare-cloned repos found under {bare_root}");
         return;
     }
-    for entry in &entries {
-        let worktree = if entry.worktree_exists { "✓" } else { "✗" };
-        println!(
-            "{}/{}  [{worktree} worktree]  {}",
-            entry.owner, entry.repo, entry.bare_repo_path
-        );
+    for row in format_repo_list(&entries) {
+        println!("{row}");
     }
+}
+
+/// Render aligned rows (header first). `WT` is worktree presence (`✓`/`✗`);
+/// `!` marks a `*.git` dir that is not actually a git repo.
+fn format_repo_list(entries: &[sgit_core::BareRepoEntry]) -> Vec<String> {
+    let name_width = entries
+        .iter()
+        .map(|e| e.owner.chars().count() + 1 + e.repo.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("REPO".len());
+
+    let mut rows = Vec::with_capacity(entries.len() + 1);
+    rows.push(format!("{:<name_width$}  {}  {}", "REPO", "WT", "PATH"));
+    for e in entries {
+        let name = format!("{}/{}", e.owner, e.repo);
+        let (mark, note) = if !e.valid {
+            ('!', "  (not a git repo)")
+        } else if e.worktree_exists {
+            ('✓', "")
+        } else {
+            ('✗', "")
+        };
+        rows.push(format!(
+            "{name:<name_width$}  {mark}   {}{note}",
+            e.bare_repo_path
+        ));
+    }
+    rows
 }
 
 // ── clone ────────────────────────────────────────────────────────────────────
@@ -910,6 +935,58 @@ fn _keep_render(cfg: &RepositoriesConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sgit_core::BareRepoEntry;
+
+    fn entry(owner: &str, repo: &str, worktree_exists: bool, valid: bool) -> BareRepoEntry {
+        BareRepoEntry {
+            owner: owner.into(),
+            repo: repo.into(),
+            bare_repo_path: format!("/opt/dev/{owner}/{repo}.git"),
+            origin_url: None,
+            default_branch: "main".into(),
+            main_worktree_path: format!("/opt/worktrees/{owner}/{repo}/main"),
+            worktree_exists,
+            valid,
+        }
+    }
+
+    #[test]
+    fn format_repo_list_aligns_columns() {
+        let entries = vec![
+            entry("InertialG", "aw-watcher-screenshot", true, true),
+            entry("openclaw", "openclaw", false, true),
+            entry("stokd-cloud", "status", true, false),
+        ];
+        let rows = format_repo_list(&entries);
+        assert_eq!(rows.len(), entries.len() + 1, "header + one row per entry");
+        assert!(rows[0].starts_with("REPO"), "header row: {}", rows[0]);
+
+        // The path column must start at the same char offset on every data row.
+        let offsets: Vec<usize> = rows[1..]
+            .iter()
+            .zip(&entries)
+            .map(|(row, e)| {
+                let byte = row
+                    .find(e.bare_repo_path.as_str())
+                    .unwrap_or_else(|| panic!("row missing path: {row}"));
+                row[..byte].chars().count()
+            })
+            .collect();
+        assert!(
+            offsets.windows(2).all(|w| w[0] == w[1]),
+            "path column misaligned: {offsets:?}\n{}",
+            rows.join("\n")
+        );
+
+        // Worktree presence markers and the invalid-dir flag are visible.
+        assert!(rows[1].contains('✓'), "existing worktree marked: {}", rows[1]);
+        assert!(rows[2].contains('✗'), "missing worktree marked: {}", rows[2]);
+        assert!(
+            rows[3].contains('!') && rows[3].contains("not a git repo"),
+            "invalid dir flagged: {}",
+            rows[3]
+        );
+    }
 
     #[test]
     fn plan_repo_clone_actions() {

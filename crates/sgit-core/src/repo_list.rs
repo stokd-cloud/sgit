@@ -23,6 +23,9 @@ pub struct BareRepoEntry {
     pub main_worktree_path: String,
     #[serde(rename = "worktreeExists")]
     pub worktree_exists: bool,
+    /// False when the `<name>.git` directory is not actually a git dir (no
+    /// HEAD) — e.g. a stray folder someone dropped under the bare root.
+    pub valid: bool,
 }
 
 /// Scan `<cfg.bare_root>` for the canonical `<owner>/<repo>.git` layout.
@@ -68,7 +71,14 @@ fn scan_bare_repos(cfg: &RepositoriesConfig, bare_root: &Path) -> Vec<BareRepoEn
                 _ => continue,
             };
 
-            let default_branch = resolve_default_branch(&repo_path);
+            // Only probe with git when the dir is a real git dir; probing junk
+            // dirs wastes spawns and used to leak `fatal:` noise to the user.
+            let valid = repo_path.join("HEAD").is_file();
+            let default_branch = if valid {
+                resolve_default_branch(&repo_path)
+            } else {
+                "-".to_string()
+            };
             let leaf_name = render_worktree_name_pattern(
                 &cfg.main_worktree_name,
                 &owner,
@@ -83,14 +93,62 @@ fn scan_bare_repos(cfg: &RepositoriesConfig, bare_root: &Path) -> Vec<BareRepoEn
                 owner: owner.clone(),
                 repo: repo_name,
                 bare_repo_path: repo_path.to_string_lossy().to_string(),
-                origin_url: resolve_origin_url(&repo_path),
+                origin_url: if valid {
+                    resolve_origin_url(&repo_path)
+                } else {
+                    None
+                },
                 default_branch,
                 main_worktree_path: worktree_dir.to_string_lossy().to_string(),
                 worktree_exists: worktree_dir.exists(),
+                valid,
             });
         }
     }
 
     entries.sort_by(|a, b| a.owner.cmp(&b.owner).then_with(|| a.repo.cmp(&b.repo)));
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn scan_bare_repos_flags_non_git_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare_root = tmp.path().join("dev");
+
+        let real = bare_root.join("owner").join("real.git");
+        fs::create_dir_all(&real).expect("mkdir real");
+        let out = Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(&real)
+            .output()
+            .expect("git init --bare");
+        assert!(out.status.success(), "git init --bare failed");
+
+        let junk = bare_root.join("owner").join("junk.git");
+        fs::create_dir_all(&junk).expect("mkdir junk");
+        fs::write(junk.join("AGENTS.md"), "not a repo").expect("write junk file");
+
+        let cfg = RepositoriesConfig {
+            bare_root: bare_root.to_string_lossy().to_string(),
+            worktree_root: tmp.path().join("worktrees").to_string_lossy().to_string(),
+            main_worktree_name: "{branch}".into(),
+            track_non_git_workspaces: false,
+            ..Default::default()
+        };
+
+        let entries = list_bare_repos(&cfg);
+        assert_eq!(entries.len(), 2, "both dirs are listed: {entries:?}");
+
+        let junk_entry = entries.iter().find(|e| e.repo == "junk").expect("junk listed");
+        assert!(!junk_entry.valid, "plain dir with .git suffix is flagged invalid");
+
+        let real_entry = entries.iter().find(|e| e.repo == "real").expect("real listed");
+        assert!(real_entry.valid, "actual bare repo is valid");
+    }
 }
