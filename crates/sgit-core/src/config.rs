@@ -335,7 +335,7 @@ repositories:
     }
 
     #[test]
-    fn submodule_checkout_defaults_to_worktree_when_absent() {
+    fn submodule_checkout_defaults_to_none_when_absent() {
         use crate::submodule_checkout::{SubmoduleCheckoutConfig, SubmoduleCheckoutMode};
         let yaml = r#"
 repositories:
@@ -345,7 +345,7 @@ repositories:
         let cfg = parse_repositories_yaml(yaml).unwrap();
         assert_eq!(
             cfg.submodule_checkout,
-            SubmoduleCheckoutConfig::Global(SubmoduleCheckoutMode::Worktree)
+            SubmoduleCheckoutConfig::Global(SubmoduleCheckoutMode::None)
         );
     }
 }

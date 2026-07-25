@@ -12,10 +12,18 @@
 //!   ```
 //!
 //! Modes:
-//! - `worktree` (default): after a superproject worktree is created, populate
-//!   each submodule by attaching a worktree of the matching bare under
+//! - `none` (default): leave gitlinks unpopulated (fast empty worktrees).
+//! - `worktree`: after a superproject worktree is created, populate each
+//!   submodule by attaching a linked worktree of the matching bare under
 //!   `bareRoot` when present; otherwise best-effort `git submodule update --init`.
-//! - `none`: leave gitlinks unpopulated (fast empty worktrees).
+//!   When the bare uses `extensions.worktreeConfig` with a shared
+//!   `core.bare=true`, a per-worktree `core.bare=false` override is written so
+//!   the attached worktree is usable (else git rejects it as "not a work tree").
+//! - `inline`: git-native embedded submodule via `git submodule update --init`
+//!   (pinned to the gitlink commit, gitdir under the superproject).
+//! - `link`: symlink the submodule path to a canonical shared checkout under
+//!   `bareRoot`, and set `submodule.<name>.ignore=all` on the superproject so a
+//!   symlinked gitlink never dirties `git status`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -29,26 +37,34 @@ use crate::layout::parse_git_remote_url;
 /// How submodules are materialized inside a newly created superproject worktree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmoduleCheckoutMode {
-    /// Attach shared worktrees from `bareRoot` (or submodule update --init fallback).
-    Worktree,
-    /// Do not populate submodule working trees.
+    /// Do not populate submodule working trees (default).
     None,
+    /// Attach shared linked worktrees from `bareRoot` (or submodule update --init fallback).
+    Worktree,
+    /// Git-native embedded submodule (`git submodule update --init`), pinned to the gitlink.
+    Inline,
+    /// Symlink the submodule path to a canonical shared checkout under `bareRoot`.
+    Link,
 }
 
 impl SubmoduleCheckoutMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            SubmoduleCheckoutMode::Worktree => "worktree",
             SubmoduleCheckoutMode::None => "none",
+            SubmoduleCheckoutMode::Worktree => "worktree",
+            SubmoduleCheckoutMode::Inline => "inline",
+            SubmoduleCheckoutMode::Link => "link",
         }
     }
 
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "worktree" | "wt" => Ok(SubmoduleCheckoutMode::Worktree),
             "none" | "off" | "false" | "no" => Ok(SubmoduleCheckoutMode::None),
+            "worktree" | "wt" => Ok(SubmoduleCheckoutMode::Worktree),
+            "inline" | "embedded" | "embed" => Ok(SubmoduleCheckoutMode::Inline),
+            "link" | "symlink" | "shared" => Ok(SubmoduleCheckoutMode::Link),
             other => Err(format!(
-                "invalid submoduleCheckout mode '{other}' (expected worktree|none)"
+                "invalid submoduleCheckout mode '{other}' (expected none|worktree|inline|link)"
             )),
         }
     }
@@ -56,7 +72,7 @@ impl SubmoduleCheckoutMode {
 
 impl Default for SubmoduleCheckoutMode {
     fn default() -> Self {
-        SubmoduleCheckoutMode::Worktree
+        SubmoduleCheckoutMode::None
     }
 }
 
@@ -78,13 +94,13 @@ impl<'de> Deserialize<'de> for SubmoduleCheckoutMode {
 pub enum SubmoduleCheckoutConfig {
     /// One mode for every repository.
     Global(SubmoduleCheckoutMode),
-    /// Per-repo overrides. Unlisted repos use [`SubmoduleCheckoutMode::Worktree`].
+    /// Per-repo overrides. Unlisted repos use [`SubmoduleCheckoutMode::None`].
     PerRepo(BTreeMap<String, SubmoduleCheckoutMode>),
 }
 
 impl Default for SubmoduleCheckoutConfig {
     fn default() -> Self {
-        SubmoduleCheckoutConfig::Global(SubmoduleCheckoutMode::Worktree)
+        SubmoduleCheckoutConfig::Global(SubmoduleCheckoutMode::None)
     }
 }
 
@@ -114,7 +130,7 @@ impl<'de> Deserialize<'de> for SubmoduleCheckoutConfig {
                         .to_string();
                     let mode_str = v.as_str().ok_or_else(|| {
                         serde::de::Error::custom(format!(
-                            "submoduleCheckout['{key}'] must be a mode string (worktree|none)"
+                            "submoduleCheckout['{key}'] must be a mode string (none|worktree|inline|link)"
                         ))
                     })?;
                     let mode =
@@ -180,7 +196,7 @@ pub fn resolve_submodule_checkout(
                     return *m;
                 }
             }
-            SubmoduleCheckoutMode::Worktree
+            SubmoduleCheckoutMode::None
         }
     }
 }
@@ -304,7 +320,7 @@ pub fn apply_submodule_checkout(
 
     let mut errors = Vec::new();
     for entry in entries {
-        if let Err(e) = materialize_one_submodule(worktree_dir, bare_root, &entry) {
+        if let Err(e) = materialize_one_submodule(worktree_dir, bare_root, &entry, mode) {
             errors.push(format!("{}: {e}", entry.path));
         }
     }
@@ -323,6 +339,7 @@ fn materialize_one_submodule(
     worktree_dir: &Path,
     bare_root: &Path,
     entry: &SubmoduleEntry,
+    mode: SubmoduleCheckoutMode,
 ) -> Result<(), String> {
     let dest = worktree_dir.join(&entry.path);
     // Already populated (has .git file/dir or non-empty tree beyond placeholder).
@@ -330,20 +347,40 @@ fn materialize_one_submodule(
         return Ok(());
     }
 
-    let commit = gitlink_commit(worktree_dir, &entry.path);
-    if let Some((owner, repo)) = parse_git_remote_url(&entry.url).or_else(|| {
-        // Relative submodule URLs are uncommon in our layout; ignore.
-        None
-    }) {
-        let bare = PathBuf::from(bare_root).join(&owner).join(format!("{repo}.git"));
-        if bare.is_dir() {
-            if let Some(ref sha) = commit {
-                return attach_worktree_at(&bare, &dest, sha);
+    match mode {
+        // Handled by the caller before we get here.
+        SubmoduleCheckoutMode::None => Ok(()),
+        // Git-native embedded submodule, pinned to the gitlink.
+        SubmoduleCheckoutMode::Inline => inline_one_submodule(worktree_dir, entry),
+        // Symlink to the canonical shared checkout; fall back to inline when
+        // no canonical checkout exists (or on non-unix).
+        SubmoduleCheckoutMode::Link => {
+            match link_one_submodule(worktree_dir, bare_root, entry) {
+                Ok(true) => Ok(()),
+                Ok(false) => inline_one_submodule(worktree_dir, entry),
+                Err(e) => Err(e),
             }
         }
+        // Attach a linked worktree of the matching bare; inline fallback otherwise.
+        SubmoduleCheckoutMode::Worktree => {
+            let commit = gitlink_commit(worktree_dir, &entry.path);
+            if let Some((owner, repo)) = parse_git_remote_url(&entry.url) {
+                let bare = PathBuf::from(bare_root)
+                    .join(&owner)
+                    .join(format!("{repo}.git"));
+                if bare.is_dir() {
+                    if let Some(ref sha) = commit {
+                        return attach_worktree_at(&bare, &dest, sha);
+                    }
+                }
+            }
+            inline_one_submodule(worktree_dir, entry)
+        }
     }
+}
 
-    // Fallback: classic submodule init for this path only.
+/// Classic `git submodule update --init -- <path>` for one submodule.
+fn inline_one_submodule(worktree_dir: &Path, entry: &SubmoduleEntry) -> Result<(), String> {
     let output = Command::new("git")
         .args(["submodule", "update", "--init", "--", &entry.path])
         .current_dir(worktree_dir)
@@ -357,6 +394,105 @@ fn materialize_one_submodule(
         ));
     }
     Ok(())
+}
+
+/// Symlink the submodule path to the canonical shared checkout of its bare.
+///
+/// Returns `Ok(true)` when a symlink was created, `Ok(false)` when no canonical
+/// checkout could be resolved (caller should fall back to inline). Sets
+/// `submodule.<name>.ignore=all` and `--skip-worktree` on the gitlink so the
+/// symlinked path never dirties the superproject's `git status`.
+fn link_one_submodule(
+    worktree_dir: &Path,
+    bare_root: &Path,
+    entry: &SubmoduleEntry,
+) -> Result<bool, String> {
+    let Some((owner, repo)) = parse_git_remote_url(&entry.url) else {
+        return Ok(false);
+    };
+    let bare = PathBuf::from(bare_root)
+        .join(&owner)
+        .join(format!("{repo}.git"));
+    if !bare.is_dir() {
+        return Ok(false);
+    }
+    let Some(canonical) = resolve_canonical_checkout(&bare) else {
+        return Ok(false);
+    };
+    let dest = worktree_dir.join(&entry.path);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create submodule parent {}: {e}", parent.display()))?;
+    }
+    // Remove empty placeholder so the symlink can claim the path.
+    if dest.is_dir() {
+        let _ = fs::remove_dir(&dest);
+    } else if dest.is_file() {
+        let _ = fs::remove_file(&dest);
+    }
+    if !symlink_path(&canonical, &dest) {
+        return Ok(false);
+    }
+    // Keep the symlinked gitlink from ever dirtying the superproject.
+    let _ = Command::new("git")
+        .args([
+            "config",
+            &format!("submodule.{}.ignore", entry.path),
+            "all",
+        ])
+        .current_dir(worktree_dir)
+        .output();
+    let _ = Command::new("git")
+        .args(["update-index", "--skip-worktree", "--", &entry.path])
+        .current_dir(worktree_dir)
+        .output();
+    Ok(true)
+}
+
+/// The canonical shared checkout for a bare: the linked worktree that is on a
+/// branch (not detached), preferring the bare's default branch. `None` when the
+/// bare has no branch-checked-out worktree.
+fn resolve_canonical_checkout(bare: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(bare)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let default_branch = crate::layout::resolve_default_branch(bare);
+    let mut current: Option<PathBuf> = None;
+    let mut fallback: Option<PathBuf> = None;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            current = Some(PathBuf::from(p.trim()));
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            let branch = b.trim().trim_start_matches("refs/heads/");
+            if let Some(ref path) = current {
+                if branch == default_branch {
+                    return Some(path.clone());
+                }
+                if fallback.is_none() {
+                    fallback = Some(path.clone());
+                }
+            }
+        }
+    }
+    fallback
+}
+
+#[cfg(unix)]
+fn symlink_path(target: &Path, link: &Path) -> bool {
+    std::os::unix::fs::symlink(target, link).is_ok()
+}
+
+#[cfg(not(unix))]
+fn symlink_path(_target: &Path, _link: &Path) -> bool {
+    // Symlink-based link mode is unix-only; caller falls back to inline.
+    false
 }
 
 fn submodule_path_populated(path: &Path) -> bool {
@@ -408,7 +544,33 @@ fn attach_worktree_at(bare: &Path, dest: &Path, commit: &str) -> Result<(), Stri
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+    // When the bare uses `extensions.worktreeConfig` with a shared
+    // `core.bare=true`, the freshly-attached worktree inherits bare-ness and git
+    // rejects it as "not a work tree". Write a per-worktree `core.bare=false`.
+    ensure_worktree_not_bare(bare, dest);
     Ok(())
+}
+
+/// When `bare` uses `extensions.worktreeConfig` with shared `core.bare=true`,
+/// set a per-worktree `core.bare=false` override in `worktree` so working-tree
+/// ops succeed. No-op when `extensions.worktreeConfig` is not enabled.
+fn ensure_worktree_not_bare(bare: &Path, worktree: &Path) {
+    let wt_config = Command::new("git")
+        .arg("-C")
+        .arg(bare)
+        .args(["config", "--bool", "extensions.worktreeConfig"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    if wt_config.as_deref() != Some("true") {
+        return;
+    }
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["config", "--worktree", "core.bare", "false"])
+        .output();
 }
 
 /// Convenience: resolve mode for owner/repo then apply.
@@ -429,15 +591,37 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn default_mode_is_worktree() {
+    fn default_mode_is_none() {
         assert_eq!(
             SubmoduleCheckoutMode::default(),
-            SubmoduleCheckoutMode::Worktree
+            SubmoduleCheckoutMode::None
         );
         assert_eq!(
             SubmoduleCheckoutConfig::default(),
-            SubmoduleCheckoutConfig::Global(SubmoduleCheckoutMode::Worktree)
+            SubmoduleCheckoutConfig::Global(SubmoduleCheckoutMode::None)
         );
+    }
+
+    #[test]
+    fn parses_inline_and_link_modes() {
+        for (raw, want) in [
+            ("inline", SubmoduleCheckoutMode::Inline),
+            ("embedded", SubmoduleCheckoutMode::Inline),
+            ("link", SubmoduleCheckoutMode::Link),
+            ("symlink", SubmoduleCheckoutMode::Link),
+            ("shared", SubmoduleCheckoutMode::Link),
+        ] {
+            assert_eq!(SubmoduleCheckoutMode::parse(raw).unwrap(), want, "raw={raw}");
+        }
+        // Round-trip through as_str().
+        for m in [
+            SubmoduleCheckoutMode::None,
+            SubmoduleCheckoutMode::Worktree,
+            SubmoduleCheckoutMode::Inline,
+            SubmoduleCheckoutMode::Link,
+        ] {
+            assert_eq!(SubmoduleCheckoutMode::parse(m.as_str()).unwrap(), m);
+        }
     }
 
     #[test]
@@ -529,12 +713,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_map_unlisted_defaults_to_worktree() {
+    fn resolve_map_unlisted_defaults_to_none() {
         let map = BTreeMap::new();
         let cfg = SubmoduleCheckoutConfig::PerRepo(map);
         assert_eq!(
             resolve_submodule_checkout(&cfg, "x", "y"),
-            SubmoduleCheckoutMode::Worktree
+            SubmoduleCheckoutMode::None
         );
     }
 
@@ -689,5 +873,190 @@ mod tests {
             "submodule path should be populated via worktree"
         );
         assert_eq!(fs::read_to_string(marker).unwrap().trim(), "from-sub");
+    }
+
+    /// mode=inline embeds the submodule (gitdir under the superproject).
+    #[test]
+    fn apply_inline_embeds_submodule() {
+        let tmp = tempdir().unwrap();
+        let sub_src = tmp.path().join("sub-src");
+        let super_repo = tmp.path().join("super");
+
+        init_repo(&sub_src);
+        fs::write(sub_src.join("marker.txt"), "inlined").unwrap();
+        git(&["add", "."], &sub_src);
+        git(&["commit", "-m", "sub"], &sub_src);
+
+        init_repo(&super_repo);
+        // Real add so the gitlink + .gitmodules are consistent for `submodule update`.
+        let mut add = Command::new("git");
+        add.args([
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &sub_src.to_string_lossy(),
+            "nested",
+        ])
+        .current_dir(&super_repo);
+        let o = add.output().unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        git(&["commit", "-m", "add sub"], &super_repo);
+        // Deinit so inline has to repopulate.
+        git(&["submodule", "deinit", "-f", "nested"], &super_repo);
+        assert!(!super_repo.join("nested").join("marker.txt").exists());
+
+        apply_submodule_checkout(&super_repo, tmp.path(), SubmoduleCheckoutMode::Inline)
+            .expect("inline should populate");
+        assert!(
+            super_repo.join("nested").join(".git").exists(),
+            "inline must embed a .git under the submodule path"
+        );
+    }
+
+    /// The worktree-mode fix: a linked worktree of a bare that uses
+    /// extensions.worktreeConfig must get a per-worktree core.bare=false, or git
+    /// rejects it as "not a work tree". Simulates the real breakage by removing
+    /// the config.worktree, then repairs it via ensure_worktree_not_bare.
+    #[test]
+    fn ensure_worktree_not_bare_repairs_missing_override() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let bare = tmp.path().join("repo.git");
+        init_repo(&src);
+        fs::write(src.join("f.txt"), "x").unwrap();
+        git(&["add", "."], &src);
+        git(&["commit", "-m", "c"], &src);
+        let o = Command::new("git")
+            .args(["clone", "--bare", &src.to_string_lossy(), &bare.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        // Bare uses worktreeConfig with shared core.bare=true (the real setup).
+        git(&["config", "extensions.worktreeConfig", "true"], &bare);
+        git(&["config", "core.bare", "true"], &bare);
+
+        let wt = tmp.path().join("wt");
+        let o = Command::new("git")
+            .args(["worktree", "add", "--detach", &wt.to_string_lossy(), "HEAD"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+        // Force the broken state: remove the per-worktree config override.
+        let wt_meta = bare.join("worktrees");
+        if let Ok(rd) = fs::read_dir(&wt_meta) {
+            for e in rd.flatten() {
+                let _ = fs::remove_file(e.path().join("config.worktree"));
+            }
+        }
+        let broken = Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&broken.stdout).trim(),
+            "false",
+            "without the override the worktree must be rejected"
+        );
+
+        ensure_worktree_not_bare(&bare, &wt);
+
+        let fixed = Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(&wt)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&fixed.stdout).trim(),
+            "true",
+            "override must make the worktree usable"
+        );
+    }
+
+    /// mode=link symlinks the submodule path to the bare's canonical (branch)
+    /// checkout and keeps the superproject `git status` clean.
+    #[test]
+    fn apply_link_symlinks_and_keeps_status_clean() {
+        if cfg!(not(unix)) {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let bare_root = tmp.path().join("bares");
+        let sub_src = tmp.path().join("sub-src");
+        let super_repo = tmp.path().join("super");
+
+        init_repo(&sub_src);
+        fs::write(sub_src.join("marker.txt"), "canonical").unwrap();
+        git(&["add", "."], &sub_src);
+        git(&["commit", "-m", "sub"], &sub_src);
+        let sha = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&sub_src)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        // Bare + a canonical checkout on branch `main`.
+        let bare = bare_root.join("acme").join("widget.git");
+        fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let o = Command::new("git")
+            .args(["clone", "--bare", &sub_src.to_string_lossy(), &bare.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let canonical = tmp.path().join("canonical-main");
+        let o = Command::new("git")
+            .args(["worktree", "add", &canonical.to_string_lossy(), "main"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+        init_repo(&super_repo);
+        fs::write(
+            super_repo.join(".gitmodules"),
+            "[submodule \"nested\"]\n\tpath = nested\n\turl = git@github.com:acme/widget.git\n",
+        )
+        .unwrap();
+        git(
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sha},nested"),
+            ],
+            &super_repo,
+        );
+        git(&["add", ".gitmodules"], &super_repo);
+        git(&["commit", "-m", "add sub"], &super_repo);
+
+        apply_submodule_checkout(&super_repo, &bare_root, SubmoduleCheckoutMode::Link)
+            .expect("link should succeed");
+
+        let dest = super_repo.join("nested");
+        assert!(
+            fs::symlink_metadata(&dest).unwrap().file_type().is_symlink(),
+            "link mode must create a symlink at the submodule path"
+        );
+        assert!(dest.join("marker.txt").is_file(), "symlink must resolve to the checkout");
+
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&super_repo)
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            !status.lines().any(|l| l.contains("nested")),
+            "link must not dirty the superproject status, got: {status:?}"
+        );
     }
 }
