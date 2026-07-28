@@ -65,6 +65,41 @@ scd owner/repo feature-branch
 
 ---
 
+## Repo lifecycle
+
+`clone`, `open`, and `create` are top-level verbs — no `repo` group needed:
+
+```bash
+sgit clone owner/repo        # bare clone + main worktree
+sgit clone repo              # owner resolved automatically (see below)
+sgit open repo               # clone if needed, then open in your editor
+sgit create repo             # create on GitHub under your account + local layout
+```
+
+A **bare repo name** is resolved to a single owner by walking a chain and
+accepting the answer only when it is unambiguous:
+
+1. **Local layout** — owners that already have the repo bare-cloned under
+   `bareRoot` or checked out under `root`. Fully offline.
+2. **Your GitHub owners** — your login plus the orgs you belong to. Consulted
+   only when the local layout knows nothing, so cloning an already-provisioned
+   repo never touches the network.
+
+If two owners match, sgit refuses to guess and asks you to qualify:
+
+```
+error: repo 'widget' is ambiguous across local clones: alpha/widget, beta/widget; qualify with <owner/repo>
+```
+
+`sgit create <name>` has no chain to walk (the repo does not exist yet), so a
+bare name is created under your own GitHub account — matching `gh repo create`.
+
+The remaining lifecycle verbs stay under the group: `sgit repo list`,
+`sgit repo rename`, `sgit repo migrate`. The old `sgit repo clone|open|create`
+spellings still work as hidden back-compat aliases.
+
+---
+
 ## Local knowledge graph
 
 sgit includes a **local-first** repo knowledge graph. Data lives under your control (default file store under `~/.sgit/graph/…`, or optional Mongo). **No stokd account** is required.
