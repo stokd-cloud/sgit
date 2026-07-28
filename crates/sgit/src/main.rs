@@ -1,8 +1,14 @@
 //! Thin `sgit` binary over `sgit-core`.
 //!
-//! Surfaces: `cd`, `repo *`, `worktree clean|pin`, `shove`. `repo graph` stays
-//! in stokd. No compile-time stokd dependency for task/project cd (D001 external
-//! resolver seam via `SGIT_REF_RESOLVER`).
+//! Surfaces: `cd`, `clone|open|create`, `repo list|rename|migrate`, `worktree
+//! clean|pin`, `shove`. `repo graph` stays in stokd. No compile-time stokd
+//! dependency for task/project cd (D001 external resolver seam via
+//! `SGIT_REF_RESOLVER`).
+//!
+//! `clone`/`open`/`create` are top-level verbs: `sgit clone <repo>` needs no
+//! `repo` group, and a bare repo name resolves to an owner through the chain in
+//! `sgit_core::repo_ref` when it is unambiguous. The `sgit repo clone|open|create`
+//! spellings remain as hidden back-compat aliases for existing callers.
 
 mod commands;
 mod github;
@@ -32,7 +38,37 @@ enum Commands {
         #[arg(value_name = "REF")]
         git_ref: Option<String>,
     },
-    /// Repository lifecycle (clone, open, list, create, rename, migrate)
+    /// Headlessly provision a repo in the bare + worktree layout (no editor)
+    Clone {
+        /// `owner/repo-name`, or a bare `repo-name` when it is unambiguous
+        #[arg(value_name = "[OWNER/]REPO")]
+        repo: String,
+        /// Emit the provisioning result as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clone (if needed) and open the main worktree in an editor
+    Open {
+        /// `owner/repo-name`, or a bare `repo-name` when it is unambiguous
+        #[arg(value_name = "[OWNER/]REPO")]
+        repo: String,
+    },
+    /// Create a GitHub repo and local bare/worktree layout
+    Create {
+        /// `owner/repo-name`, or a bare `repo-name` (created under your account)
+        #[arg(value_name = "[OWNER/]REPO")]
+        repo: String,
+        /// Path to the local source directory
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+        /// After validation, delete the original source and reopen editors
+        #[arg(short = 'f', long)]
+        force: bool,
+        /// Create a public repository (defaults to private)
+        #[arg(long)]
+        public: bool,
+    },
+    /// Repository lifecycle (list, rename, migrate)
     Repo {
         #[command(subcommand)]
         command: RepoCommands,
@@ -58,25 +94,28 @@ enum RepoCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Headlessly provision a repo in the bare + worktree layout (no editor)
+    /// Deprecated alias for `sgit clone`
+    #[command(hide = true)]
     Clone {
-        /// GitHub owner/repo-name (e.g. "myorg/my-project")
-        #[arg(value_name = "OWNER/REPO")]
+        /// `owner/repo-name`, or a bare `repo-name` when it is unambiguous
+        #[arg(value_name = "[OWNER/]REPO")]
         repo: String,
         /// Emit the provisioning result as JSON
         #[arg(long)]
         json: bool,
     },
-    /// Clone (if needed) and open the main worktree in an editor
+    /// Deprecated alias for `sgit open`
+    #[command(hide = true)]
     Open {
-        /// GitHub owner/repo-name (e.g. "myorg/my-project")
-        #[arg(value_name = "OWNER/REPO")]
+        /// `owner/repo-name`, or a bare `repo-name` when it is unambiguous
+        #[arg(value_name = "[OWNER/]REPO")]
         repo: String,
     },
-    /// Create a GitHub repo and local bare/worktree layout
+    /// Deprecated alias for `sgit create`
+    #[command(hide = true)]
     Create {
-        /// GitHub owner/repo-name (e.g. "myorg/my-project")
-        #[arg(value_name = "OWNER/REPO")]
+        /// `owner/repo-name`, or a bare `repo-name` (created under your account)
+        #[arg(value_name = "[OWNER/]REPO")]
         repo: String,
         /// Path to the local source directory
         #[arg(value_name = "PATH")]
@@ -142,23 +181,34 @@ enum WorktreeCommands {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
+        // Promoted top-level verbs and their `repo *` back-compat aliases share
+        // one implementation each.
+        Commands::Clone { repo, json }
+        | Commands::Repo {
+            command: RepoCommands::Clone { repo, json },
+        } => commands::repo::run_clone(&repo, json),
+        Commands::Open { repo }
+        | Commands::Repo {
+            command: RepoCommands::Open { repo },
+        } => commands::repo::run_open(&repo),
+        Commands::Create {
+            repo,
+            path,
+            force,
+            public,
+        }
+        | Commands::Repo {
+            command:
+                RepoCommands::Create {
+                    repo,
+                    path,
+                    force,
+                    public,
+                },
+        } => commands::repo::run_create(&repo, path.as_deref(), force, public),
         Commands::Repo {
             command: RepoCommands::List { json },
         } => commands::repo::run_list(json),
-        Commands::Repo {
-            command: RepoCommands::Clone { repo, json },
-        } => commands::repo::run_clone(&repo, json),
-        Commands::Repo {
-            command: RepoCommands::Open { repo },
-        } => commands::repo::run_open(&repo),
-        Commands::Repo {
-            command: RepoCommands::Create {
-                repo,
-                path,
-                force,
-                public,
-            },
-        } => commands::repo::run_create(&repo, path.as_deref(), force, public),
         Commands::Repo {
             command: RepoCommands::Rename { repo, new_repo },
         } => commands::repo::run_rename(&repo, &new_repo),
@@ -180,5 +230,93 @@ fn main() {
             command: WorktreeCommands::Pin { all, off, json },
         } => commands::worktree::run_pin(all, off, json),
         Commands::Shove { message } => commands::shove::run(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).unwrap_or_else(|e| panic!("parse {args:?} failed: {e}"))
+    }
+
+    #[test]
+    fn clone_is_available_without_the_repo_group() {
+        assert!(matches!(
+            parse(&["sgit", "clone", "stokd-cloud/sgit"]).command,
+            Commands::Clone { ref repo, json: false } if repo == "stokd-cloud/sgit"
+        ));
+        // A bare repo name is accepted; the owner is resolved through the chain.
+        assert!(matches!(
+            parse(&["sgit", "clone", "sgit"]).command,
+            Commands::Clone { ref repo, .. } if repo == "sgit"
+        ));
+        assert!(matches!(
+            parse(&["sgit", "clone", "sgit", "--json"]).command,
+            Commands::Clone { json: true, .. }
+        ));
+    }
+
+    #[test]
+    fn open_and_create_are_available_without_the_repo_group() {
+        assert!(matches!(
+            parse(&["sgit", "open", "sgit"]).command,
+            Commands::Open { ref repo } if repo == "sgit"
+        ));
+        assert!(matches!(
+            parse(&["sgit", "create", "sgit"]).command,
+            Commands::Create { ref repo, path: None, force: false, public: false } if repo == "sgit"
+        ));
+        assert!(matches!(
+            parse(&["sgit", "create", "acme/widget", "./src", "-f", "--public"]).command,
+            Commands::Create {
+                path: Some(_),
+                force: true,
+                public: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn repo_group_keeps_the_lifecycle_verbs_as_back_compat_aliases() {
+        // Existing callers (`packages/repo-refs`, menubar) still shell out to
+        // `sgit repo clone … --json`; the old spelling must keep working.
+        assert!(matches!(
+            parse(&["sgit", "repo", "clone", "acme/widget", "--json"]).command,
+            Commands::Repo {
+                command: RepoCommands::Clone { json: true, .. }
+            }
+        ));
+        assert!(matches!(
+            parse(&["sgit", "repo", "open", "acme/widget"]).command,
+            Commands::Repo {
+                command: RepoCommands::Open { .. }
+            }
+        ));
+        assert!(matches!(
+            parse(&["sgit", "repo", "create", "acme/widget"]).command,
+            Commands::Repo {
+                command: RepoCommands::Create { .. }
+            }
+        ));
+        // Verbs that were not promoted stay under `repo` only.
+        assert!(matches!(
+            parse(&["sgit", "repo", "list"]).command,
+            Commands::Repo {
+                command: RepoCommands::List { .. }
+            }
+        ));
+        assert!(Cli::try_parse_from(["sgit", "list"]).is_err());
+    }
+
+    #[test]
+    fn promoted_verbs_are_visible_in_top_level_help() {
+        let help = Cli::command().render_help().to_string();
+        for verb in ["clone", "open", "create"] {
+            assert!(help.contains(verb), "top-level help missing '{verb}':\n{help}");
+        }
     }
 }

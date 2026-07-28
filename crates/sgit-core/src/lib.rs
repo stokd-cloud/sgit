@@ -8,6 +8,7 @@ mod config;
 pub mod layout;
 pub mod migrate_ops;
 mod repo_list;
+mod repo_ref;
 pub mod shove;
 pub mod submodule_checkout;
 pub mod worktree_clean;
@@ -40,6 +41,10 @@ pub use migrate_ops::{
     WorktreeRepairTarget,
 };
 pub use repo_list::{list_bare_repos, BareRepoEntry};
+pub use repo_ref::{
+    describe_owner_resolution_failure, local_owners_for_repo, parse_repo_spec, resolve_owner_chain,
+    OwnerResolution, OwnerSource, RepoSpec,
+};
 pub use shove::{
     shove, shove_backup_branch_names, CapturedGit, CommitOutcome, ConflictContext, ConflictKind,
     ConflictResolver, PushDecision, ShoveOptions,

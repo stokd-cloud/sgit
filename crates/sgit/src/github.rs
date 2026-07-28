@@ -1,9 +1,94 @@
-//! GitHub helpers for `sgit repo create` / `repo rename` (HTTP + `gh` CLI).
+//! GitHub helpers for `sgit create` / `repo rename` and for the remote link of
+//! the bare-repo-name owner chain (HTTP + `gh` CLI).
 //!
 //! Kept in the binary crate (not sgit-core) so the core library stays free of
 //! HTTP clients. Token resolution mirrors stokd: `GITHUB_TOKEN` → `gh auth token`.
 
 use std::process::Command;
+
+/// Owners reachable by the authenticated user: their own login first, then the
+/// orgs they belong to (sorted). Empty when the token is unusable.
+pub fn github_owner_chain(token: &str) -> Vec<String> {
+    let mut owners = Vec::new();
+    if let Some(login) = authenticated_login(token) {
+        owners.push(login);
+    }
+    let mut orgs = authenticated_orgs(token);
+    orgs.sort();
+    owners.extend(orgs);
+    owners.dedup();
+    owners
+}
+
+/// The authenticated user's login (`GET /user`).
+pub fn authenticated_login(token: &str) -> Option<String> {
+    let value = github_get_json(token, "https://api.github.com/user")?;
+    value
+        .get("login")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Org logins the authenticated user belongs to (`GET /user/orgs`).
+fn authenticated_orgs(token: &str) -> Vec<String> {
+    let Some(value) = github_get_json(token, "https://api.github.com/user/orgs?per_page=100") else {
+        return Vec::new();
+    };
+    value
+        .as_array()
+        .map(|orgs| {
+            orgs.iter()
+                .filter_map(|o| o.get("login").and_then(|v| v.as_str()))
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Owners in `chain` that actually have a repo named `repo` on GitHub.
+pub fn owners_with_remote_repo(token: &str, chain: &[String], repo: &str) -> Vec<String> {
+    chain
+        .iter()
+        .filter(|owner| remote_repo_exists(token, owner, repo))
+        .cloned()
+        .collect()
+}
+
+/// Whether `owner/repo` exists and is visible to the token.
+fn remote_repo_exists(token: &str, owner: &str, repo: &str) -> bool {
+    let Ok(client) = http_client() else {
+        return false;
+    };
+    client
+        .get(format!("https://api.github.com/repos/{owner}/{repo}"))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "sgit")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+fn github_get_json(token: &str, url: &str) -> Option<serde_json::Value> {
+    let client = http_client().ok()?;
+    let response = client
+        .get(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("User-Agent", "sgit")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json::<serde_json::Value>().ok()
+}
+
+fn http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
+    reqwest::blocking::Client::builder().use_rustls_tls().build()
+}
 
 /// Resolve a GitHub token: `GITHUB_TOKEN` env, then `gh auth token`.
 pub fn resolve_github_token() -> Option<String> {

@@ -16,17 +16,23 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sgit_core::{
-    apply_submodule_checkout_for_repo, bare_clone, create_worktree, list_bare_repos,
-    list_linked_worktrees, load_repositories_config,
-    move_bare, move_worktree, normalize_path, render_worktree_name_pattern, resolve_default_branch,
-    resolve_repo_layout, run_git_dir, worktree_dir_for_branch, ApplyStatus, RepositoriesConfig,
-    RepoLayout, WorktreeRepairTarget,
+    apply_submodule_checkout_for_repo, bare_clone, create_worktree,
+    describe_owner_resolution_failure, list_bare_repos, list_linked_worktrees,
+    load_repositories_config, local_owners_for_repo, move_bare, move_worktree, normalize_path,
+    parse_repo_spec, render_worktree_name_pattern, resolve_default_branch, resolve_owner_chain,
+    resolve_repo_layout, run_git_dir, worktree_dir_for_branch, ApplyStatus, OwnerResolution,
+    RepositoriesConfig, RepoLayout, RepoSpec, WorktreeRepairTarget,
 };
 
-use crate::github::{create_github_repo, resolve_github_token, set_default_branch};
+use crate::github::{
+    authenticated_login, create_github_repo, github_owner_chain, owners_with_remote_repo,
+    resolve_github_token, set_default_branch,
+};
 
 // ── shared ───────────────────────────────────────────────────────────────────
 
+/// Strict `owner/repo` parse — used where a bare name has no sensible owner
+/// (both sides of `repo rename`).
 fn parse_owner_repo(repo_spec: &str) -> (String, String) {
     match repo_spec.split_once('/') {
         Some((o, r)) if !o.is_empty() && !r.is_empty() => (o.to_string(), r.to_string()),
@@ -35,6 +41,56 @@ fn parse_owner_repo(repo_spec: &str) -> (String, String) {
             std::process::exit(1);
         }
     }
+}
+
+/// Resolve a `clone`/`open` argument. A bare repo name walks the owner chain:
+/// local bare clones + worktrees first (offline), then the GitHub owners you can
+/// reach. Ambiguity is an error rather than a guess.
+fn resolve_existing_repo_arg(repo_spec: &str, cfg: &RepositoriesConfig) -> (String, String) {
+    let repo = match parse_repo_spec(repo_spec).unwrap_or_else(|e| die(e)) {
+        RepoSpec::OwnerRepo { owner, repo } => return (owner, repo),
+        RepoSpec::BareName { repo } => repo,
+    };
+
+    let local = local_owners_for_repo(cfg, &repo);
+    // Only reach for the network when the local layout knows nothing.
+    let remote = if local.is_empty() {
+        resolve_github_token()
+            .map(|token| owners_with_remote_repo(&token, &github_owner_chain(&token), &repo))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let resolution = resolve_owner_chain(&local, &remote);
+    if let Some(message) = describe_owner_resolution_failure(&repo, &resolution) {
+        die(message);
+    }
+    let OwnerResolution::Resolved { owner, source } = resolution else {
+        unreachable!("failure described above");
+    };
+    eprintln!("# resolved '{repo}' to {owner}/{repo} via {}", source.label());
+    (owner, repo)
+}
+
+/// Resolve a `create` argument. The repo does not exist yet, so a bare name has
+/// no chain to walk — it is created under your own GitHub account, matching
+/// `gh repo create <name>`.
+fn resolve_new_repo_arg(repo_spec: &str) -> (String, String) {
+    let repo = match parse_repo_spec(repo_spec).unwrap_or_else(|e| die(e)) {
+        RepoSpec::OwnerRepo { owner, repo } => return (owner, repo),
+        RepoSpec::BareName { repo } => repo,
+    };
+
+    let owner = resolve_github_token()
+        .and_then(|token| authenticated_login(&token))
+        .unwrap_or_else(|| {
+            die(format!(
+                "could not resolve a GitHub account to create '{repo}' under; qualify with <owner/repo> or authenticate with `gh auth login`"
+            ))
+        });
+    eprintln!("# creating under your GitHub account: {owner}/{repo}");
+    (owner, repo)
 }
 
 fn load_cfg() -> RepositoriesConfig {
@@ -169,8 +225,8 @@ fn plan_repo_clone(bare_exists: bool, worktree_exists: bool) -> RepoCloneAction 
 }
 
 pub fn run_clone(repo_spec: &str, json: bool) {
-    let (owner, repo_name) = parse_owner_repo(repo_spec);
     let cfg = load_cfg();
+    let (owner, repo_name) = resolve_existing_repo_arg(repo_spec, &cfg);
     let mut layout = resolve_repo_layout(&cfg, &owner, &repo_name);
 
     let action = plan_repo_clone(layout.bare_dir.exists(), layout.worktree_dir.exists());
@@ -262,8 +318,8 @@ fn plan_repo_open(bare_exists: bool, worktree_exists: bool) -> RepoOpenAction {
 }
 
 pub fn run_open(repo_spec: &str) {
-    let (owner, repo_name) = parse_owner_repo(repo_spec);
     let cfg = load_cfg();
+    let (owner, repo_name) = resolve_existing_repo_arg(repo_spec, &cfg);
     let mut layout = resolve_repo_layout(&cfg, &owner, &repo_name);
 
     match plan_repo_open(layout.bare_dir.exists(), layout.worktree_dir.exists()) {
@@ -405,7 +461,7 @@ fn preferred_editor_cli() -> String {
 // MOVE of apps/cli/src/commands/repo.rs:758-857 (+ helpers). See handoff diff notes.
 
 pub fn run_create(repo_spec: &str, source_path: Option<&str>, force: bool, prefer_public: bool) {
-    let (owner, repo_name) = parse_owner_repo(repo_spec);
+    let (owner, repo_name) = resolve_new_repo_arg(repo_spec);
 
     let source = source_path.map(|p| {
         let s = PathBuf::from(p);
