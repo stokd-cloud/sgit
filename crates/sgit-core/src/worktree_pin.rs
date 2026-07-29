@@ -205,7 +205,7 @@ pub fn discover_bare_repos(bare_root: &Path) -> Vec<PathBuf> {
 
 /// Default hooks version embedded in the pin's reference-transaction script when
 /// installed by sgit (independent of stokd's full hook set version).
-pub const PIN_HOOKS_VERSION: u32 = 4;
+pub const PIN_HOOKS_VERSION: u32 = 5;
 
 /// Subdirectory under the common git dir for sgit-managed pin hooks when no
 /// existing `core.hooksPath` is configured.
@@ -572,7 +572,7 @@ mod tests {
 
     #[test]
     fn pin_refusal_states_rule_and_advertises_no_off_switch() {
-        let s = reference_transaction_script(4);
+        let s = reference_transaction_script(PIN_HOOKS_VERSION);
         for leak in ["to unpin", "pin --off", "pinBranch", "ask the human"] {
             assert!(!s.contains(leak), "pin refusal leaks an off-switch: {leak:?}");
         }
