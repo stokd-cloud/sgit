@@ -403,7 +403,7 @@ if [ "$state" = "prepared" ]; then
       if [ $? -eq 39 ]; then
         echo "stokd: refusing to move this worktree off '$pinned'." >&2
         echo "stokd: a worktree directory must match its branch. NEVER repoint a worktree folder at a different branch." >&2
-        echo "stokd: to work on another branch, create a separate 'git worktree' for it." >&2
+        echo "stokd: to work on another branch, run: sgit checkout <branch>" >&2
         exit 1
       fi
     fi
@@ -578,6 +578,9 @@ mod tests {
         }
         assert!(s.contains("a worktree directory must match its branch"));
         assert!(s.contains("NEVER repoint a worktree folder at a different branch"));
-        assert!(s.contains("create a separate 'git worktree'"));
+        assert!(
+            s.contains("sgit checkout"),
+            "pin refusal must advertise sgit checkout as the safe alternative"
+        );
     }
 }

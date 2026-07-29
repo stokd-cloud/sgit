@@ -1,8 +1,8 @@
 //! Thin `sgit` binary over `sgit-core`.
 //!
-//! Surfaces: `cd`, `clone|open|create`, `repo list|rename|migrate`, `worktree
-//! clean|pin`, `shove`. `repo graph` stays in stokd. No compile-time stokd
-//! dependency for task/project cd (D001 external resolver seam via
+//! Surfaces: `cd`, `checkout`, `clone|open|create`, `repo list|rename|migrate`,
+//! `worktree clean|pin`, `shove`. `repo graph` stays in stokd. No compile-time
+//! stokd dependency for task/project cd (D001 external resolver seam via
 //! `SGIT_REF_RESOLVER`).
 //!
 //! `clone`/`open`/`create` are top-level verbs: `sgit clone <repo>` needs no
@@ -37,6 +37,12 @@ enum Commands {
         /// Optional branch/ref
         #[arg(value_name = "REF")]
         git_ref: Option<String>,
+    },
+    /// Ensure a sibling worktree for BRANCH and print its path (never switches in place)
+    Checkout {
+        /// Branch name to check out into a dedicated worktree folder
+        #[arg(value_name = "BRANCH")]
+        branch: String,
     },
     /// Headlessly provision a repo in the bare + worktree layout (no editor)
     Clone {
@@ -223,6 +229,7 @@ fn main() {
                 },
         } => commands::repo_migrate::run(plan, apply, interactive, orphan_days, filter),
         Commands::Cd { target, git_ref } => commands::cd::run(target, git_ref),
+        Commands::Checkout { branch } => commands::checkout::run(&branch),
         Commands::Worktree {
             command: WorktreeCommands::Clean { dry_run },
         } => commands::worktree::run_clean(dry_run),
@@ -315,8 +322,17 @@ mod tests {
     #[test]
     fn promoted_verbs_are_visible_in_top_level_help() {
         let help = Cli::command().render_help().to_string();
-        for verb in ["clone", "open", "create"] {
+        for verb in ["clone", "open", "create", "checkout"] {
             assert!(help.contains(verb), "top-level help missing '{verb}':\n{help}");
         }
+    }
+
+    #[test]
+    fn checkout_parses_branch_arg() {
+        assert!(matches!(
+            parse(&["sgit", "checkout", "feature/foo"]).command,
+            Commands::Checkout { ref branch } if branch == "feature/foo"
+        ));
+        assert!(Cli::try_parse_from(["sgit", "checkout"]).is_err());
     }
 }

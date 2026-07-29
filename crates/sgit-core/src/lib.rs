@@ -4,6 +4,7 @@
 //! orchestration-domain imports. Config discovery is path-based only (D002).
 
 mod cd;
+mod checkout;
 mod config;
 pub mod layout;
 pub mod migrate_ops;
@@ -20,6 +21,10 @@ pub use cd::{
     candidate_leaves_for_ref, first_present, is_task_or_project_ref, leaves_under,
     owners_with_repo, parse_cd_target, resolve_owner_from_candidates, resolve_worktree_path,
     select_worktree_leaf, CdTarget,
+};
+pub use checkout::{
+    branch_worktree_leaf, ensure_branch_worktree, normalize_branch_name,
+    preferred_branch_worktree_path, EnsureBranchWorktree,
 };
 pub use config::{
     load_repositories_config, resolve_config_path, ConfigSource, RepositoriesConfig,

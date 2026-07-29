@@ -65,6 +65,34 @@ scd owner/repo feature-branch
 
 ---
 
+## `sgit checkout <branch>`
+
+Pin-safe branch navigation. **Never** switches the current worktree's branch in
+place (pinned worktrees refuse that). Instead it:
+
+1. Reuses an existing linked worktree already on `<branch>`, or
+2. Creates a new sibling worktree under the configured worktree root in a folder
+   named for the branch (slashes sanitized to dashes), then
+3. Prints the absolute path (the shell `sgit()` wrapper `cd`s into it).
+
+```bash
+# From any worktree of the repo (e.g. main):
+sgit checkout feature/login   # → /opt/worktrees/owner/repo/feature-login
+sgit checkout main            # reuses the existing main worktree
+```
+
+Branch source when creating:
+
+| Situation | Action |
+|-----------|--------|
+| Local branch exists | Check it out in the new worktree |
+| Only `origin/<branch>` | Create a tracking local branch |
+| Neither | Cut a new branch from `origin/<default>` (fallback: current HEAD) |
+
+New worktrees are pin-marked so they cannot later be repointed at another branch.
+
+---
+
 ## Repo lifecycle
 
 `clone`, `open`, and `create` are top-level verbs — no `repo` group needed:

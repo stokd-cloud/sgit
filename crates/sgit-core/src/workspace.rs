@@ -98,12 +98,15 @@ pub fn resolve_default_branch_at(path: &Path) -> String {
     }
 
     for candidate in ["origin/main", "origin/master", "main", "master"] {
+        // Use `.output()` (not `.status()`): even with `--quiet`, a successful
+        // `git rev-parse --verify` prints the resolved oid to stdout. Inheriting
+        // that would leak a raw SHA into `sgit checkout`'s path-only stdout.
         let verify = Command::new("git")
             .arg("-C")
             .arg(path)
             .args(["rev-parse", "--verify", "--quiet", candidate])
-            .status();
-        if matches!(verify, Ok(status) if status.success()) {
+            .output();
+        if matches!(verify, Ok(output) if output.status.success()) {
             return candidate
                 .strip_prefix("origin/")
                 .unwrap_or(candidate)
