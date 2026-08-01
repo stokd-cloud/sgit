@@ -31,8 +31,9 @@ pub use config::{
 };
 pub use submodule_checkout::{
     apply_submodule_checkout, apply_submodule_checkout_for_repo, normalize_repo_key,
-    normalize_repo_slug, resolve_submodule_checkout, SubmoduleCheckoutConfig,
-    SubmoduleCheckoutMode,
+    normalize_repo_slug, resolve_child_submodule_mode, resolve_submodule_checkout,
+    ChildModeSpec, RepoSubmodulesFile, SubmoduleCheckoutConfig, SubmoduleCheckoutMode,
+    REPO_SUBMODULES_REL,
 };
 pub use layout::{
     bare_clone, bare_clone_from_url, bare_placeholder_branch, create_worktree,

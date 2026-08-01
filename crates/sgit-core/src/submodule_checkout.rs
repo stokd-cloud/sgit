@@ -1,8 +1,15 @@
 //! Submodule materialization policy for worktree creation.
 //!
-//! Config key: `repositories.submoduleCheckout` / `git.submoduleCheckout`.
+//! ## Config layers (lowest → highest)
 //!
-//! Forms:
+//! 1. Built-in default: [`SubmoduleCheckoutMode::None`]
+//! 2. Machine / workspace config: `git.submoduleCheckout` /
+//!    `repositories.submoduleCheckout` (scalar, or per-**superproject** map)
+//! 3. Committed repo policy: [`.stokd/submodules.yaml`](RepoSubmodulesFile)
+//!    — **per-child** modes; overrides config when present
+//!    ([`AX-SGIT-SUBMODULE-POLICY-FILE`])
+//!
+//! Config forms:
 //! - scalar: `submoduleCheckout: worktree` (default for every repo)
 //! - map: per superproject repo:
 //!   ```yaml
@@ -10,6 +17,18 @@
 //!     "@owner/repo1": worktree
 //!     "@owner/repo2": none
 //!   ```
+//!
+//! Repo file (`.stokd/submodules.yaml`):
+//! ```yaml
+//! version: 1
+//! default: none
+//! children:
+//!   apps/sgit: none
+//!   apps/ghostty-dock:
+//!     mode: link
+//! by_slug:
+//!   stokd-cloud/code: none
+//! ```
 //!
 //! Modes:
 //! - `none` (default): leave gitlinks unpopulated (fast empty worktrees).
@@ -201,6 +220,154 @@ pub fn resolve_submodule_checkout(
     }
 }
 
+/// Relative path of the committed per-child policy file (AX-SGIT-SUBMODULE-POLICY-FILE).
+pub const REPO_SUBMODULES_REL: &str = ".stokd/submodules.yaml";
+
+/// One child entry in [`.stokd/submodules.yaml`](RepoSubmodulesFile): bare mode
+/// string or `{ mode: … }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildModeSpec {
+    pub mode: SubmoduleCheckoutMode,
+}
+
+impl ChildModeSpec {
+    pub fn new(mode: SubmoduleCheckoutMode) -> Self {
+        Self { mode }
+    }
+}
+
+impl Serialize for ChildModeSpec {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.mode.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ChildModeSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::String(s) => {
+                let mode = SubmoduleCheckoutMode::parse(&s).map_err(serde::de::Error::custom)?;
+                Ok(ChildModeSpec { mode })
+            }
+            serde_yaml::Value::Mapping(map) => {
+                let mode_val = map
+                    .get(serde_yaml::Value::String("mode".into()))
+                    .ok_or_else(|| serde::de::Error::custom("child entry requires 'mode'"))?;
+                let mode_str = mode_val.as_str().ok_or_else(|| {
+                    serde::de::Error::custom("child.mode must be a string (none|worktree|inline|link)")
+                })?;
+                let mode =
+                    SubmoduleCheckoutMode::parse(mode_str).map_err(serde::de::Error::custom)?;
+                Ok(ChildModeSpec { mode })
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "child entry: expected mode string or {{mode: …}}, got {other:?}"
+            ))),
+        }
+    }
+}
+
+/// Committed superproject policy at [`.stokd/submodules.yaml`](REPO_SUBMODULES_REL).
+///
+/// Overrides machine/workspace `submoduleCheckout` for individual children.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoSubmodulesFile {
+    /// Schema version (currently informational; default 1).
+    #[serde(default = "repo_submodules_default_version")]
+    pub version: u32,
+    /// Mode for children not listed under `children` / `by_slug`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<SubmoduleCheckoutMode>,
+    /// Per-path modes (keys match `.gitmodules` `path`, e.g. `apps/sgit`).
+    #[serde(default)]
+    pub children: BTreeMap<String, ChildModeSpec>,
+    /// Per-remote-slug modes (`owner/repo`, optional `@` / `.git`).
+    #[serde(default, rename = "by_slug", alias = "bySlug")]
+    pub by_slug: BTreeMap<String, ChildModeSpec>,
+}
+
+fn repo_submodules_default_version() -> u32 {
+    1
+}
+
+impl RepoSubmodulesFile {
+    /// Load from `worktree_dir/.stokd/submodules.yaml`. `Ok(None)` if missing.
+    pub fn load(worktree_dir: &Path) -> Result<Option<Self>, String> {
+        let path = worktree_dir.join(REPO_SUBMODULES_REL);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let file: Self = serde_yaml::from_str(&text)
+            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        Ok(Some(file))
+    }
+
+    /// Parse YAML text (tests / tooling).
+    pub fn parse_yaml(text: &str) -> Result<Self, String> {
+        serde_yaml::from_str(text).map_err(|e| e.to_string())
+    }
+}
+
+/// Resolve mode for one child submodule.
+///
+/// Order (highest wins first):
+/// 1. `file.children[path]` (path normalized: trim, strip trailing `/`)
+/// 2. `file.by_slug[owner/repo]` derived from `url`
+/// 3. `file.default` when the file is present
+/// 4. `superproject_mode` from config cascade
+pub fn resolve_child_submodule_mode(
+    file: Option<&RepoSubmodulesFile>,
+    superproject_mode: SubmoduleCheckoutMode,
+    child_path: &str,
+    child_url: &str,
+) -> SubmoduleCheckoutMode {
+    let Some(file) = file else {
+        return superproject_mode;
+    };
+
+    let path_key = normalize_child_path(child_path);
+    // Exact path, then case-insensitive path match.
+    if let Some(spec) = file.children.get(&path_key) {
+        return spec.mode;
+    }
+    for (k, spec) in &file.children {
+        if normalize_child_path(k) == path_key {
+            return spec.mode;
+        }
+    }
+
+    if let Some((owner, repo)) = parse_git_remote_url(child_url) {
+        let slug = normalize_repo_slug(&owner, &repo);
+        for candidate in [
+            format!("@{slug}"),
+            slug.clone(),
+            format!("@{slug}.git"),
+            format!("{slug}.git"),
+        ] {
+            if let Some(spec) = file.by_slug.get(&candidate) {
+                return spec.mode;
+            }
+        }
+        for (k, spec) in &file.by_slug {
+            if normalize_repo_key(k) == slug {
+                return spec.mode;
+            }
+        }
+    }
+
+    if let Some(d) = file.default {
+        return d;
+    }
+    superproject_mode
+}
+
+fn normalize_child_path(raw: &str) -> String {
+    raw.trim().trim_end_matches('/').to_string()
+}
+
 #[derive(Debug, Clone)]
 struct SubmoduleEntry {
     path: String,
@@ -299,17 +466,19 @@ fn gitlink_commit(worktree_dir: &Path, sub_path: &str) -> Option<String> {
     }
 }
 
-/// Materialize submodules for `worktree_dir` according to `mode`.
+/// Materialize submodules for `worktree_dir`.
+///
+/// `superproject_mode` is the config-layer fallback for each child (from
+/// `git.submoduleCheckout` for this superproject). When
+/// [`.stokd/submodules.yaml`](REPO_SUBMODULES_REL) is present, each child is
+/// resolved via [`resolve_child_submodule_mode`].
 ///
 /// `bare_root` is the stokd/sgit bare-clone root used for shared worktree attach.
 pub fn apply_submodule_checkout(
     worktree_dir: &Path,
     bare_root: &Path,
-    mode: SubmoduleCheckoutMode,
+    superproject_mode: SubmoduleCheckoutMode,
 ) -> Result<(), String> {
-    if matches!(mode, SubmoduleCheckoutMode::None) {
-        return Ok(());
-    }
     if !worktree_dir.is_dir() {
         return Ok(());
     }
@@ -318,8 +487,29 @@ pub fn apply_submodule_checkout(
         return Ok(());
     }
 
+    let policy = match RepoSubmodulesFile::load(worktree_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            // Do not hard-fail worktree create on a bad policy file; surface it.
+            return Err(e);
+        }
+    };
+    // Fast path: no policy file and superproject says none → nothing to do.
+    if policy.is_none() && matches!(superproject_mode, SubmoduleCheckoutMode::None) {
+        return Ok(());
+    }
+
     let mut errors = Vec::new();
     for entry in entries {
+        let mode = resolve_child_submodule_mode(
+            policy.as_ref(),
+            superproject_mode,
+            &entry.path,
+            &entry.url,
+        );
+        if matches!(mode, SubmoduleCheckoutMode::None) {
+            continue;
+        }
         if let Err(e) = materialize_one_submodule(worktree_dir, bare_root, &entry, mode) {
             errors.push(format!("{}: {e}", entry.path));
         }
@@ -738,6 +928,128 @@ mod tests {
         assert_eq!(entries[0].path, "apps/sgit");
         assert_eq!(entries[0].url, "git@github.com:stokd-cloud/sgit.git");
         assert_eq!(entries[1].path, "apps/code");
+    }
+
+    #[test]
+    fn parse_repo_submodules_file_scalar_and_object_children() {
+        let yaml = r#"
+version: 1
+default: none
+children:
+  apps/sgit: none
+  apps/ghostty-dock:
+    mode: link
+by_slug:
+  stokd-cloud/code: inline
+"#;
+        let file = RepoSubmodulesFile::parse_yaml(yaml).expect("parse");
+        assert_eq!(file.version, 1);
+        assert_eq!(file.default, Some(SubmoduleCheckoutMode::None));
+        assert_eq!(
+            file.children.get("apps/sgit").map(|c| c.mode),
+            Some(SubmoduleCheckoutMode::None)
+        );
+        assert_eq!(
+            file.children.get("apps/ghostty-dock").map(|c| c.mode),
+            Some(SubmoduleCheckoutMode::Link)
+        );
+        assert_eq!(
+            file.by_slug.get("stokd-cloud/code").map(|c| c.mode),
+            Some(SubmoduleCheckoutMode::Inline)
+        );
+    }
+
+    #[test]
+    fn resolve_child_prefers_path_then_slug_then_file_default_then_superproject() {
+        let yaml = r#"
+default: worktree
+children:
+  apps/sgit: none
+by_slug:
+  stokd-cloud/ghostty-dock: link
+"#;
+        let file = RepoSubmodulesFile::parse_yaml(yaml).unwrap();
+
+        // Path wins.
+        assert_eq!(
+            resolve_child_submodule_mode(
+                Some(&file),
+                SubmoduleCheckoutMode::Inline,
+                "apps/sgit",
+                "git@github.com:stokd-cloud/sgit.git",
+            ),
+            SubmoduleCheckoutMode::None
+        );
+        // by_slug when path unlisted.
+        assert_eq!(
+            resolve_child_submodule_mode(
+                Some(&file),
+                SubmoduleCheckoutMode::Inline,
+                "apps/ghostty-dock",
+                "git@github.com:stokd-cloud/ghostty-dock.git",
+            ),
+            SubmoduleCheckoutMode::Link
+        );
+        // file default when neither path nor slug matches.
+        assert_eq!(
+            resolve_child_submodule_mode(
+                Some(&file),
+                SubmoduleCheckoutMode::Inline,
+                "apps/status",
+                "git@github.com:stokd-cloud/status.git",
+            ),
+            SubmoduleCheckoutMode::Worktree
+        );
+        // No file → superproject mode.
+        assert_eq!(
+            resolve_child_submodule_mode(
+                None,
+                SubmoduleCheckoutMode::Inline,
+                "apps/sgit",
+                "git@github.com:stokd-cloud/sgit.git",
+            ),
+            SubmoduleCheckoutMode::Inline
+        );
+    }
+
+    #[test]
+    fn resolve_child_file_without_default_falls_back_to_superproject() {
+        let yaml = r#"
+children:
+  apps/sgit: link
+"#;
+        let file = RepoSubmodulesFile::parse_yaml(yaml).unwrap();
+        assert_eq!(
+            resolve_child_submodule_mode(
+                Some(&file),
+                SubmoduleCheckoutMode::None,
+                "apps/code",
+                "git@github.com:stokd-cloud/code.git",
+            ),
+            SubmoduleCheckoutMode::None
+        );
+    }
+
+    #[test]
+    fn load_repo_submodules_file_from_worktree() {
+        let dir = tempdir().unwrap();
+        let stokd = dir.path().join(".stokd");
+        fs::create_dir_all(&stokd).unwrap();
+        fs::write(
+            stokd.join("submodules.yaml"),
+            "version: 1\ndefault: none\nchildren:\n  apps/sgit: link\n",
+        )
+        .unwrap();
+        let loaded = RepoSubmodulesFile::load(dir.path())
+            .unwrap()
+            .expect("file present");
+        assert_eq!(loaded.default, Some(SubmoduleCheckoutMode::None));
+        assert_eq!(
+            loaded.children.get("apps/sgit").map(|c| c.mode),
+            Some(SubmoduleCheckoutMode::Link)
+        );
+        let empty = tempdir().unwrap();
+        assert!(RepoSubmodulesFile::load(empty.path()).unwrap().is_none());
     }
 
     fn git(args: &[&str], cwd: &Path) {
