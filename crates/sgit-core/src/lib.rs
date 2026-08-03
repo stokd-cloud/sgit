@@ -3,10 +3,12 @@
 //! Pure local git layout helpers only — no HTTP client, no cloud SDK, and no
 //! orchestration-domain imports. Config discovery is path-based only (D002).
 
+pub mod biometric;
 mod cd;
 mod checkout;
 mod config;
 pub mod layout;
+pub mod lock;
 pub mod migrate_ops;
 mod repo_list;
 mod repo_ref;
@@ -54,6 +56,14 @@ pub use repo_ref::{
 pub use shove::{
     shove, shove_backup_branch_names, CapturedGit, CommitOutcome, ConflictContext, ConflictKind,
     ConflictResolver, PushDecision, ShoveOptions,
+};
+pub use biometric::require_biometric;
+pub use lock::{
+    add_lock, default_registry_path, effective_locks, gated_refs, gated_refs_for_hook,
+    install_lock_hooks, install_pre_push_hook, pre_push_lock_fragment, read_registry,
+    read_repo_locks, refs_from_pre_push, refs_from_reference_transaction, registry_key,
+    remove_lock, standalone_pre_push_script, write_repo_locks, LockHook, LockSet,
+    LOCK_WILDCARD, REGISTRY_RELATIVE_PATH, REPO_LOCKS_FILE,
 };
 pub use worktree_clean::{remove_worktree, run_clean_at, CleanSummary};
 pub use worktree_lease::{
