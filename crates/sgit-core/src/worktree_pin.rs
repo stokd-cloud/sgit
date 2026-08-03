@@ -205,7 +205,7 @@ pub fn discover_bare_repos(bare_root: &Path) -> Vec<PathBuf> {
 
 /// Default hooks version embedded in the pin's reference-transaction script when
 /// installed by sgit (independent of stokd's full hook set version).
-pub const PIN_HOOKS_VERSION: u32 = 5;
+pub const PIN_HOOKS_VERSION: u32 = 6;
 
 /// Subdirectory under the common git dir for sgit-managed pin hooks when no
 /// existing `core.hooksPath` is configured.
@@ -248,7 +248,7 @@ pub fn install_reference_transaction_hook(anchor: &Path) -> Result<PathBuf, Stri
     Ok(script_path)
 }
 
-fn resolve_hooks_dir_for_pin(common_dir: &Path) -> Result<PathBuf, String> {
+pub(crate) fn resolve_hooks_dir_for_pin(common_dir: &Path) -> Result<PathBuf, String> {
     // Prefer an existing core.hooksPath so we co-install with stokd/husky.
     if let Some(configured) = git_config_get(common_dir, "core.hooksPath") {
         let candidate = PathBuf::from(&configured);
@@ -276,7 +276,7 @@ fn resolve_hooks_dir_for_pin(common_dir: &Path) -> Result<PathBuf, String> {
     Ok(sgit_hooks)
 }
 
-fn write_hook_script(path: &Path, content: &str) -> Result<(), String> {
+pub(crate) fn write_hook_script(path: &Path, content: &str) -> Result<(), String> {
     if let Ok(existing) = std::fs::read_to_string(path) {
         if existing == content {
             set_executable(path);
@@ -385,7 +385,7 @@ pub fn reference_transaction_script(hooks_version: u32) -> String {
 # allowed ref. Inert on unpinned worktrees and plain clones.
 state="$1"
 input="$(cat)"
-if [ "$state" = "prepared" ]; then
+{lock_fragment}if [ "$state" = "prepared" ]; then
   gd="${{GIT_DIR:-}}"
   [ -z "$gd" ] && gd="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
   marker="$gd/{marker}"
@@ -424,6 +424,7 @@ exit 0
 "#,
         version = hooks_version,
         marker = PIN_MARKER_FILE,
+        lock_fragment = crate::lock::reference_transaction_lock_fragment(),
     )
 }
 

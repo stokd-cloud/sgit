@@ -90,6 +90,28 @@ enum Commands {
         #[arg(short, long)]
         message: Option<String>,
     },
+    /// Branch/repo lock inspection and hook plumbing
+    Lock {
+        #[command(subcommand)]
+        command: LockCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum LockCommands {
+    /// List the effective locks for the current repo
+    List {
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Hook plumbing: decide + biometric-gate a ref operation (stdin = hook input)
+    #[command(hide = true)]
+    Enforce {
+        /// Which hook is asking (reference-transaction | pre-push)
+        #[arg(value_name = "HOOK")]
+        hook: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -132,6 +154,18 @@ enum RepoCommands {
         /// Create a public repository (defaults to private)
         #[arg(long)]
         public: bool,
+    },
+    /// Require a biometric approval to commit/push anywhere in a repo
+    Lock {
+        /// Remove the lock instead (biometric-gated)
+        #[arg(long)]
+        off: bool,
+        /// Target repo as owner/repo (defaults to the repo you are in)
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Rename on GitHub and relocate local bare + worktrees
     Rename {
@@ -178,6 +212,21 @@ enum WorktreeCommands {
         /// Remove pin markers instead of installing
         #[arg(long)]
         off: bool,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Require a biometric approval to commit/push to a branch (default: current)
+    Lock {
+        /// Remove the lock instead (biometric-gated)
+        #[arg(long)]
+        off: bool,
+        /// Target repo as owner/repo (defaults to the repo you are in)
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// Branch to lock (defaults to the current branch; required with --repo)
+        #[arg(long, value_name = "BRANCH")]
+        branch: Option<String>,
         /// Emit JSON
         #[arg(long)]
         json: bool,
@@ -236,6 +285,24 @@ fn main() {
         Commands::Worktree {
             command: WorktreeCommands::Pin { all, off, json },
         } => commands::worktree::run_pin(all, off, json),
+        Commands::Worktree {
+            command:
+                WorktreeCommands::Lock {
+                    off,
+                    repo,
+                    branch,
+                    json,
+                },
+        } => commands::lock::run_worktree_lock(off, repo, branch, json),
+        Commands::Repo {
+            command: RepoCommands::Lock { off, repo, json },
+        } => commands::lock::run_repo_lock(off, repo, json),
+        Commands::Lock {
+            command: LockCommands::List { json },
+        } => commands::lock::run_list(json),
+        Commands::Lock {
+            command: LockCommands::Enforce { hook },
+        } => commands::lock::run_enforce(&hook),
         Commands::Shove { message } => commands::shove::run(message),
     }
 }
@@ -325,6 +392,59 @@ mod tests {
         for verb in ["clone", "open", "create", "checkout"] {
             assert!(help.contains(verb), "top-level help missing '{verb}':\n{help}");
         }
+    }
+
+    #[test]
+    fn lock_verbs_parse() {
+        assert!(matches!(
+            parse(&["sgit", "worktree", "lock"]).command,
+            Commands::Worktree {
+                command: WorktreeCommands::Lock { off: false, repo: None, branch: None, json: false }
+            }
+        ));
+        assert!(matches!(
+            parse(&[
+                "sgit", "worktree", "lock", "--off", "--repo", "acme/widget", "--branch", "main"
+            ])
+            .command,
+            Commands::Worktree {
+                command: WorktreeCommands::Lock { off: true, repo: Some(_), branch: Some(_), .. }
+            }
+        ));
+        assert!(matches!(
+            parse(&["sgit", "repo", "lock"]).command,
+            Commands::Repo {
+                command: RepoCommands::Lock { off: false, repo: None, json: false }
+            }
+        ));
+        assert!(matches!(
+            parse(&["sgit", "lock", "list", "--json"]).command,
+            Commands::Lock {
+                command: LockCommands::List { json: true }
+            }
+        ));
+        assert!(matches!(
+            parse(&["sgit", "lock", "enforce", "pre-push"]).command,
+            Commands::Lock {
+                command: LockCommands::Enforce { ref hook }
+            } if hook == "pre-push"
+        ));
+    }
+
+    #[test]
+    fn lock_verbs_visible_in_help() {
+        let worktree_help = Cli::command()
+            .find_subcommand_mut("worktree")
+            .expect("worktree group")
+            .render_help()
+            .to_string();
+        assert!(worktree_help.contains("lock"), "worktree help missing lock:\n{worktree_help}");
+        let repo_help = Cli::command()
+            .find_subcommand_mut("repo")
+            .expect("repo group")
+            .render_help()
+            .to_string();
+        assert!(repo_help.contains("lock"), "repo help missing lock:\n{repo_help}");
     }
 
     #[test]
