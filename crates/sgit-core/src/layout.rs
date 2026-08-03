@@ -201,10 +201,38 @@ pub fn bare_clone(owner: &str, repo_name: &str, bare_dir: &Path) -> Result<(), S
     bare_clone_from_url(&remote_url, bare_dir)
 }
 
+/// True when `worktree_dir` is a usable linked worktree of `bare_dir`:
+/// `git rev-parse --is-inside-work-tree` succeeds and the common git dir is the bare.
+pub fn is_valid_linked_worktree(worktree_dir: &Path, bare_dir: &Path) -> bool {
+    if !worktree_dir.is_dir() {
+        return false;
+    }
+    let inside = Command::new("git")
+        .arg("-C")
+        .arg(worktree_dir)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+        .unwrap_or(false);
+    if !inside {
+        return false;
+    }
+    let Some(common) = crate::worktree_pin::resolve_common_git_dir(worktree_dir) else {
+        return false;
+    };
+    same_path(&common, bare_dir)
+}
+
 /// `git worktree add <worktree_dir> <branch>` against a bare repo.
 ///
-/// Does not install stokd-specific hooks or cloud worktree-count refresh —
-/// those stay stokd-domain. Optionally pins the worktree when `pin` is true.
+/// Creates all missing parent directories of `worktree_dir`. Does not install
+/// stokd-specific hooks or cloud worktree-count refresh — those stay
+/// stokd-domain. Optionally pins the worktree when `pin` is true.
+///
+/// When the bare uses `extensions.worktreeConfig`, writes a per-worktree
+/// `core.bare=false` so the new tree is usable (same fix as submodule attach).
 pub fn create_worktree(
     bare_dir: &Path,
     worktree_dir: &Path,
@@ -219,19 +247,58 @@ pub fn create_worktree(
     }
 
     if let Some(parent) = worktree_dir.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create worktree directory parent: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "cannot create worktree directory parent {}: {e}",
+                parent.display()
+            )
+        })?;
     }
 
-    let output = Command::new("git")
-        .args(["worktree", "add", &worktree_dir.to_string_lossy(), branch])
+    // Ensure bareRoot / worktreeRoot themselves exist when this is the first
+    // repo under a fresh layout (create_dir_all on the immediate parent is not
+    // enough if bareRoot itself is missing and bare_clone already created it).
+    if let Some(grand) = worktree_dir.parent().and_then(|p| p.parent()) {
+        let _ = std::fs::create_dir_all(grand);
+    }
+
+    // Drop stale admin entries when the directory was deleted out-of-band
+    // ("missing but already registered worktree").
+    prune_worktree_registration(bare_dir, worktree_dir);
+
+    let path_str = worktree_dir.to_string_lossy().to_string();
+    let mut output = Command::new("git")
+        .args(["worktree", "add", &path_str, branch])
         .current_dir(bare_dir)
         .output()
         .map_err(|e| format!("failed to run git worktree add: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // Retry once with -f after another prune for "already registered" races.
+        if stderr.contains("already registered") || stderr.contains("already exists") {
+            prune_worktree_registration(bare_dir, worktree_dir);
+            output = Command::new("git")
+                .args(["worktree", "add", "-f", &path_str, branch])
+                .current_dir(bare_dir)
+                .output()
+                .map_err(|e| format!("failed to run git worktree add -f: {e}"))?;
+        }
+    }
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("worktree creation failed: {stderr}"));
+    }
+
+    ensure_main_worktree_not_bare(bare_dir, worktree_dir);
+
+    if !is_valid_linked_worktree(worktree_dir, bare_dir) {
+        return Err(format!(
+            "worktree was created at {} but has no usable git connection to {}",
+            worktree_dir.display(),
+            bare_dir.display()
+        ));
     }
 
     if pin {
@@ -244,6 +311,44 @@ pub fn create_worktree(
     }
 
     Ok(())
+}
+
+/// Best-effort clear of a stale worktree registration for `worktree` on `bare`.
+fn prune_worktree_registration(bare: &Path, worktree: &Path) {
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(bare)
+        .output();
+    let _ = Command::new("git")
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            &worktree.to_string_lossy(),
+        ])
+        .current_dir(bare)
+        .output();
+}
+
+/// When `bare` enables `extensions.worktreeConfig`, force `core.bare=false` on
+/// the new worktree so working-tree ops succeed (mirrors submodule attach).
+fn ensure_main_worktree_not_bare(bare: &Path, worktree: &Path) {
+    let wt_config = Command::new("git")
+        .arg("-C")
+        .arg(bare)
+        .args(["config", "--bool", "extensions.worktreeConfig"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    if wt_config.as_deref() != Some("true") {
+        return;
+    }
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["config", "--worktree", "core.bare", "false"])
+        .output();
 }
 
 /// Enumerate working-tree directories linked to a bare repo (excludes the bare).

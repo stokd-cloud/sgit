@@ -38,10 +38,10 @@ enum Commands {
         #[arg(value_name = "REF")]
         git_ref: Option<String>,
     },
-    /// Ensure a sibling worktree for BRANCH and print its path (never switches in place)
+    /// Ensure a sibling worktree for a branch, or the main worktree for a repo, and print its path
     Checkout {
-        /// Branch name to check out into a dedicated worktree folder
-        #[arg(value_name = "BRANCH")]
+        /// Branch name, `owner/repo`, or bare repo name (shell wrapper cds into the printed path)
+        #[arg(value_name = "TARGET")]
         branch: String,
     },
     /// Headlessly provision a repo in the bare + worktree layout (no editor)
@@ -452,6 +452,14 @@ mod tests {
         assert!(matches!(
             parse(&["sgit", "checkout", "feature/foo"]).command,
             Commands::Checkout { ref branch } if branch == "feature/foo"
+        ));
+        assert!(matches!(
+            parse(&["sgit", "checkout", "stokd-cloud/sgit"]).command,
+            Commands::Checkout { ref branch } if branch == "stokd-cloud/sgit"
+        ));
+        assert!(matches!(
+            parse(&["sgit", "checkout", "sgit"]).command,
+            Commands::Checkout { ref branch } if branch == "sgit"
         ));
         assert!(Cli::try_parse_from(["sgit", "checkout"]).is_err());
     }

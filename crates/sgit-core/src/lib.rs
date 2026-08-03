@@ -25,8 +25,9 @@ pub use cd::{
     select_worktree_leaf, CdTarget,
 };
 pub use checkout::{
-    branch_worktree_leaf, ensure_branch_worktree, normalize_branch_name,
-    preferred_branch_worktree_path, EnsureBranchWorktree,
+    branch_worktree_leaf, classify_checkout_target, ensure_branch_worktree,
+    ensure_repo_main_worktree, ensure_repo_main_worktree_from_url, normalize_branch_name,
+    preferred_branch_worktree_path, CheckoutKind, EnsureBranchWorktree, EnsureRepoWorktree,
 };
 pub use config::{
     load_repositories_config, resolve_config_path, ConfigSource, RepositoriesConfig,
@@ -39,10 +40,10 @@ pub use submodule_checkout::{
 };
 pub use layout::{
     bare_clone, bare_clone_from_url, bare_placeholder_branch, create_worktree,
-    list_linked_worktrees, main_worktree_leaf, normalize_path, parse_git_remote_url,
-    point_bare_head_to_placeholder, render_worktree_name_pattern, resolve_default_branch,
-    resolve_origin_url, resolve_repo_layout, run_git_dir, same_path, worktree_dir_for_branch,
-    BARE_PLACEHOLDER_HEAD, RepoLayout,
+    is_valid_linked_worktree, list_linked_worktrees, main_worktree_leaf, normalize_path,
+    parse_git_remote_url, point_bare_head_to_placeholder, render_worktree_name_pattern,
+    resolve_default_branch, resolve_origin_url, resolve_repo_layout, run_git_dir, same_path,
+    worktree_dir_for_branch, BARE_PLACEHOLDER_HEAD, RepoLayout,
 };
 pub use migrate_ops::{
     materialize_main_worktree, move_bare, move_worktree, ApplyStatus, UnsafeReason,
