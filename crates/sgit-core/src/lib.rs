@@ -25,9 +25,10 @@ pub use cd::{
     select_worktree_leaf, CdTarget,
 };
 pub use checkout::{
-    branch_worktree_leaf, classify_checkout_target, ensure_branch_worktree,
-    ensure_repo_main_worktree, ensure_repo_main_worktree_from_url, normalize_branch_name,
-    preferred_branch_worktree_path, CheckoutKind, EnsureBranchWorktree, EnsureRepoWorktree,
+    branch_worktree_leaf, classify_checkout_target, classify_checkout_target_with_cfg,
+    ensure_branch_worktree, ensure_repo_main_worktree, ensure_repo_main_worktree_from_url,
+    normalize_branch_name, preferred_branch_worktree_path, CheckoutKind, EnsureBranchWorktree,
+    EnsureRepoWorktree,
 };
 pub use config::{
     load_repositories_config, resolve_config_path, ConfigSource, RepositoriesConfig,

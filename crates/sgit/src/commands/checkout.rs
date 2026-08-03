@@ -5,7 +5,7 @@
 //! `cd`). Diagnostics go to stderr; failures exit non-zero with empty stdout.
 
 use sgit_core::{
-    classify_checkout_target, describe_owner_resolution_failure, detect_repo_root_at,
+    classify_checkout_target_with_cfg, describe_owner_resolution_failure, detect_repo_root_at,
     ensure_branch_worktree, ensure_repo_main_worktree, load_repositories_config,
     local_owners_for_repo, parse_repo_spec, resolve_owner_chain, CheckoutKind, OwnerResolution,
     RepositoriesConfig, RepoSpec,
@@ -32,7 +32,7 @@ pub fn run(target: &str) {
     };
 
     let repo_root = detect_repo_root_at(&cwd);
-    let kind = classify_checkout_target(target, repo_root.as_deref());
+    let kind = classify_checkout_target_with_cfg(target, repo_root.as_deref(), Some(&cfg));
 
     match kind {
         CheckoutKind::Branch(branch) => run_branch(&cwd, &branch, &cfg),
@@ -44,9 +44,10 @@ pub fn run(target: &str) {
             match try_repo(&spec, &cfg) {
                 Ok(()) => {}
                 Err(repo_err) => {
-                    // Fall back to branch create when inside a repo and the
-                    // target is a bare name that did not resolve as a repo.
-                    if repo_root.is_some() && !spec.contains('/') {
+                    // Fall back to branch create when inside a git repo so
+                    // ambiguous names (bare or owner/repo-shaped) still work
+                    // as sibling worktrees when the remote/layout is missing.
+                    if repo_root.is_some() {
                         eprintln!(
                             "sgit checkout: repo resolve failed ({repo_err}); treating '{spec}' as a branch"
                         );

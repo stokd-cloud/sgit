@@ -107,8 +107,10 @@ Branch source when creating:
 
 New worktrees are pin-marked so they cannot later be repointed at another branch.
 
-`owner/repo` is treated as a branch only when a **local** branch of that exact
-name already exists; otherwise it is a repo target.
+Classification while inside a git repo: existing branches and names under
+`feature/` / `task/` / `project/` / `fix/` / … are always branch targets.
+GitHub-shaped `owner/repo` is a repo target (falls back to a sibling branch
+worktree if ensure fails). Outside a git repo, every target is treated as a repo.
 
 ---
 
