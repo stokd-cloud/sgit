@@ -65,10 +65,26 @@ scd owner/repo feature-branch
 
 ---
 
-## `sgit checkout <branch>`
+## `sgit checkout <branch | owner/repo | reponame>`
 
-Pin-safe branch navigation. **Never** switches the current worktree's branch in
-place (pinned worktrees refuse that). Instead it:
+Two modes, chosen by the target shape (and existing local branches):
+
+### Repo target — `owner/repo` or bare `reponame`
+
+Ensures the bare + main worktree layout and prints the main worktree path
+(shell `sgit()` wrapper `cd`s into it). Creates missing parent directories,
+bare-clones when needed, and re-materializes a destination that exists without
+a valid git connection when it is safe to do so.
+
+```bash
+sgit checkout stokd-cloud/sgit   # → /opt/worktrees/stokd-cloud/sgit/main
+sgit checkout sgit               # bare name; owner resolved like clone/open
+```
+
+### Branch target — sibling worktree (never in-place)
+
+**Never** switches the current worktree's branch in place (pinned worktrees
+refuse that). Instead it:
 
 1. Reuses an existing linked worktree already on `<branch>`, or
 2. Creates a new sibling worktree under the configured worktree root in a folder
@@ -90,6 +106,11 @@ Branch source when creating:
 | Neither | Cut a new branch from `origin/<default>` (fallback: current HEAD) |
 
 New worktrees are pin-marked so they cannot later be repointed at another branch.
+
+Classification while inside a git repo: existing branches and names under
+`feature/` / `task/` / `project/` / `fix/` / … are always branch targets.
+GitHub-shaped `owner/repo` is a repo target (falls back to a sibling branch
+worktree if ensure fails). Outside a git repo, every target is treated as a repo.
 
 ---
 

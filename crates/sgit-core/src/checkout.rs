@@ -1,15 +1,23 @@
-//! Pin-safe branch checkout (AX-CLI-CHECKOUT-SIBLING-WORKTREE).
+//! Pin-safe checkout (AX-CLI-CHECKOUT-SIBLING-WORKTREE + AX-CLI-CHECKOUT-REPO-TARGET).
 //!
-//! `sgit checkout <branch>` never switches the current worktree's branch in place.
-//! It reuses an existing linked worktree for the branch, or creates a sibling
-//! worktree under the configured worktree root whose leaf is the sanitized
-//! branch name, then returns that path for shell navigation.
+//! `sgit checkout` accepts two target classes:
+//!
+//! 1. **Branch** — never switches the current worktree in place; reuses or
+//!    creates a sibling linked worktree under the configured worktree root.
+//! 2. **Repo** (`owner/repo` or bare `reponame`) — ensures the bare + main
+//!    worktree layout (creating missing parents, clone if needed), repairs
+//!    destinations that exist without a valid git connection when safe, and
+//!    returns the absolute main worktree path for the shell wrapper to `cd`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::RepositoriesConfig;
-use crate::layout::{parse_git_remote_url, render_worktree_name_pattern};
+use crate::layout::{
+    bare_clone_from_url, create_worktree, is_valid_linked_worktree, parse_git_remote_url,
+    render_worktree_name_pattern, resolve_default_branch, resolve_repo_layout,
+    worktree_dir_for_branch,
+};
 use crate::worktree_pin::{resolve_common_git_dir, write_pin_marker};
 use crate::workspace::{detect_repo_root_at, find_worktree_for_branch_at, resolve_default_branch_at};
 
@@ -22,6 +30,325 @@ pub struct EnsureBranchWorktree {
     pub created: bool,
     /// Human-readable source of the branch content (for stderr diagnostics).
     pub source: String,
+}
+
+/// Outcome of ensuring the main worktree for a repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsureRepoWorktree {
+    /// Absolute path of the main worktree.
+    pub path: PathBuf,
+    /// True when bare and/or main worktree were created or re-materialized.
+    pub created: bool,
+    /// Human-readable source for stderr diagnostics.
+    pub source: String,
+}
+
+/// How `sgit checkout <target>` should interpret its argument (first pass).
+///
+/// Repo specs still need owner resolution (bare names) and may fall back to
+/// branch create when resolution fails while inside a git repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutKind {
+    /// Ensure a sibling worktree for this branch of the current repo.
+    Branch(String),
+    /// Ensure the main worktree for this repo spec (`owner/repo` or bare name).
+    RepoSpec(String),
+}
+
+/// Classify a checkout argument.
+///
+/// Rules (AX-CLI-CHECKOUT-REPO-TARGET):
+/// - **Outside** a git repo → always [`CheckoutKind::RepoSpec`].
+/// - **Inside** a git repo:
+///   - local or `origin/<name>` branch exists → Branch
+///   - slash form matching a branch namespace (`feature/`, `task/`, `fix/`, …)
+///     → Branch (agents create these constantly; must not be misread as owner/repo)
+///   - slash form whose `owner/repo` already exists under configured bare/worktree
+///     roots → RepoSpec
+///   - bare name with no matching branch → RepoSpec (owner resolution later;
+///     may fall back to branch create on failure)
+///   - other slash form with no local layout match → Branch (new sibling branch)
+///
+/// `cfg` is optional: when provided, local bare/worktree layout is consulted for
+/// slash-form repo detection. When `None`, slash form outside a known branch
+/// namespace is still treated as Branch while inside a repo (safe default).
+pub fn classify_checkout_target(raw: &str, repo_root: Option<&Path>) -> CheckoutKind {
+    classify_checkout_target_with_cfg(raw, repo_root, None)
+}
+
+/// Like [`classify_checkout_target`] but consults `cfg` for local repo layout.
+pub fn classify_checkout_target_with_cfg(
+    raw: &str,
+    repo_root: Option<&Path>,
+    cfg: Option<&RepositoriesConfig>,
+) -> CheckoutKind {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return CheckoutKind::RepoSpec(String::new());
+    }
+
+    let Some(root) = repo_root else {
+        return CheckoutKind::RepoSpec(trimmed.to_string());
+    };
+
+    // Existing branch (local or origin) always wins.
+    if branch_exists_local(root, trimmed) || branch_exists_remote(root, trimmed) {
+        return CheckoutKind::Branch(trimmed.to_string());
+    }
+
+    if !trimmed.contains('/') {
+        // Bare name, no matching branch → try as repo (owner resolution).
+        return CheckoutKind::RepoSpec(trimmed.to_string());
+    }
+
+    // Slash form, no matching branch.
+    if looks_like_branch_namespace(trimmed) {
+        return CheckoutKind::Branch(trimmed.to_string());
+    }
+
+    // Slash form that is not a branch namespace: prefer repo (local layout or
+    // remote ensure). CLI falls back to branch create if owner resolution /
+    // clone fails while still inside a git repo.
+    if let Some((owner, repo)) = trimmed.split_once('/') {
+        if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') {
+            if cfg.map(|c| local_repo_layout_exists(c, trimmed)).unwrap_or(false)
+                || looks_like_owner_repo_pair(owner, repo)
+            {
+                return CheckoutKind::RepoSpec(trimmed.to_string());
+            }
+        }
+    }
+
+    // Default while inside a repo: new sibling branch.
+    CheckoutKind::Branch(trimmed.to_string())
+}
+
+/// Heuristic: owner and repo segments look like GitHub slugs (not multi-path branch names).
+fn looks_like_owner_repo_pair(owner: &str, repo: &str) -> bool {
+    // Reject path-like or ref-like junk.
+    if owner.starts_with('.') || repo.starts_with('.') {
+        return false;
+    }
+    if owner.contains('\\') || repo.contains('\\') {
+        return false;
+    }
+    // GitHub owner/repo segments are typically [A-Za-z0-9._-] with at least one letter.
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            && s.chars().any(|c| c.is_ascii_alphabetic())
+    };
+    ok(owner) && ok(repo)
+}
+
+/// Common multi-segment branch prefixes that must never be treated as owner/repo.
+fn looks_like_branch_namespace(raw: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "feature/",
+        "feat/",
+        "fix/",
+        "bugfix/",
+        "hotfix/",
+        "chore/",
+        "docs/",
+        "refactor/",
+        "test/",
+        "ci/",
+        "build/",
+        "release/",
+        "task/",
+        "project/",
+        "wip/",
+        "tmp/",
+        "temp/",
+        "claude/",
+        "codex/",
+        "cursor/",
+        "agent/",
+        "dependabot/",
+        "renovate/",
+    ];
+    let lower = raw.to_ascii_lowercase();
+    PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
+/// True when bare and/or worktree root already has `owner/repo` provisioned.
+fn local_repo_layout_exists(cfg: &RepositoriesConfig, owner_repo: &str) -> bool {
+    let Some((owner, repo)) = owner_repo.split_once('/') else {
+        return false;
+    };
+    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
+        return false;
+    }
+    let bare = PathBuf::from(&cfg.bare_root)
+        .join(owner)
+        .join(format!("{repo}.git"));
+    if bare.is_dir() {
+        return true;
+    }
+    let wt = PathBuf::from(&cfg.worktree_root).join(owner).join(repo);
+    wt.is_dir()
+}
+
+/// Ensure bare + main worktree for `owner/repo` using the GitHub SSH remote.
+pub fn ensure_repo_main_worktree(
+    owner: &str,
+    repo_name: &str,
+    cfg: &RepositoriesConfig,
+) -> Result<EnsureRepoWorktree, String> {
+    let remote_url = format!("git@github.com:{owner}/{repo_name}.git");
+    ensure_repo_main_worktree_from_url(owner, repo_name, &remote_url, cfg)
+}
+
+/// Ensure bare + main worktree for `owner/repo` from an arbitrary remote URL
+/// (tests use a local `file://` or path remote).
+pub fn ensure_repo_main_worktree_from_url(
+    owner: &str,
+    repo_name: &str,
+    remote_url: &str,
+    cfg: &RepositoriesConfig,
+) -> Result<EnsureRepoWorktree, String> {
+    // Layout roots must exist so later create_dir_all on nested parents never
+    // fails with "can't write to a folder that isn't there".
+    std::fs::create_dir_all(&cfg.bare_root).map_err(|e| {
+        format!(
+            "cannot create bareRoot {}: {e}",
+            cfg.bare_root
+        )
+    })?;
+    std::fs::create_dir_all(&cfg.worktree_root).map_err(|e| {
+        format!(
+            "cannot create worktreeRoot {}: {e}",
+            cfg.worktree_root
+        )
+    })?;
+
+    let mut layout = resolve_repo_layout(cfg, owner, repo_name);
+    let mut source_parts: Vec<String> = Vec::new();
+    let mut bare_created = false;
+
+    if !layout.bare_dir.exists() {
+        bare_clone_from_url(remote_url, &layout.bare_dir)?;
+        bare_created = true;
+        source_parts.push(format!("bare-cloned {owner}/{repo_name}"));
+    }
+
+    let branch = resolve_default_branch(&layout.bare_dir);
+    layout.worktree_dir = worktree_dir_for_branch(cfg, owner, repo_name, &branch);
+
+    if is_valid_linked_worktree(&layout.worktree_dir, &layout.bare_dir) {
+        return Ok(EnsureRepoWorktree {
+            path: canonicalize_existing(&layout.worktree_dir),
+            created: bare_created,
+            source: if bare_created {
+                source_parts.join("; ")
+            } else {
+                format!("existing main worktree for {owner}/{repo_name} ({branch})")
+            },
+        });
+    }
+
+    if layout.worktree_dir.exists() {
+        safe_remove_invalid_worktree_dir(&layout.worktree_dir, &layout.bare_dir)?;
+        source_parts.push("re-materialized invalid worktree path".to_string());
+    }
+
+    create_worktree(&layout.bare_dir, &layout.worktree_dir, &branch, true)?;
+    if source_parts.is_empty() {
+        source_parts.push(format!("created main worktree on {branch}"));
+    }
+    let created = true;
+
+    if let Err(e) = crate::submodule_checkout::apply_submodule_checkout_for_repo(
+        &layout.worktree_dir,
+        cfg,
+        owner,
+        repo_name,
+    ) {
+        eprintln!("warning: submodule checkout: {e}");
+    }
+
+    Ok(EnsureRepoWorktree {
+        path: canonicalize_existing(&layout.worktree_dir),
+        created,
+        source: source_parts.join("; "),
+    })
+}
+
+/// Remove `path` when it is safe to re-materialize: empty, or only a broken
+/// `.git` marker with no usable connection. Refuses when non-git content would
+/// be destroyed.
+fn safe_remove_invalid_worktree_dir(path: &Path, bare_dir: &Path) -> Result<(), String> {
+    // Drop stale admin entries that may still point at this path.
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(bare_dir)
+        .output();
+    let _ = Command::new("git")
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            &path.to_string_lossy(),
+        ])
+        .current_dir(bare_dir)
+        .output();
+
+    if !path.exists() {
+        return Ok(());
+    }
+
+    if is_dir_empty(path) {
+        std::fs::remove_dir_all(path).map_err(|e| {
+            format!("cannot remove empty worktree path {}: {e}", path.display())
+        })?;
+        return Ok(());
+    }
+
+    if only_broken_git_marker(path) {
+        std::fs::remove_dir_all(path).map_err(|e| {
+            format!(
+                "cannot remove broken worktree path {}: {e}",
+                path.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    Err(format!(
+        "worktree path exists but has no git connection to {}: {}; move or remove it, then retry",
+        bare_dir.display(),
+        path.display()
+    ))
+}
+
+fn is_dir_empty(path: &Path) -> bool {
+    std::fs::read_dir(path)
+        .map(|mut rd| rd.next().is_none())
+        .unwrap_or(false)
+}
+
+/// True when the only entry is a non-functional `.git` file/dir (or the tree is
+/// empty of meaningful content after prune).
+fn only_broken_git_marker(path: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(path) else {
+        return false;
+    };
+    let entries: Vec<_> = rd.flatten().collect();
+    if entries.is_empty() {
+        return true;
+    }
+    if entries.len() != 1 {
+        return false;
+    }
+    let name = entries[0].file_name();
+    if name != *".git" {
+        return false;
+    }
+    // Presence of .git alone does not mean usable; caller already checked
+    // is_valid_linked_worktree is false.
+    true
 }
 
 /// Normalize a user-supplied branch name: strip `refs/heads/`, reject empty.
@@ -439,5 +766,200 @@ mod tests {
             "main",
             "invoking worktree must stay on its branch"
         );
+    }
+
+    #[test]
+    fn classify_owner_repo_uses_local_layout_or_outside_repo() {
+        let (tmp, primary) = scratch_repo();
+        let cfg = test_cfg(tmp.path());
+        // GitHub-shaped owner/repo → try as repo (CLI falls back to branch if missing).
+        assert_eq!(
+            classify_checkout_target_with_cfg("acme/widget", Some(&primary), Some(&cfg)),
+            CheckoutKind::RepoSpec("acme/widget".into())
+        );
+        // Local layout present → still repo.
+        std::fs::create_dir_all(PathBuf::from(&cfg.worktree_root).join("acme").join("widget"))
+            .unwrap();
+        assert_eq!(
+            classify_checkout_target_with_cfg("acme/widget", Some(&primary), Some(&cfg)),
+            CheckoutKind::RepoSpec("acme/widget".into())
+        );
+        // Local branch always wins.
+        git(&primary, &["branch", "acme/widget"]);
+        assert_eq!(
+            classify_checkout_target_with_cfg("acme/widget", Some(&primary), Some(&cfg)),
+            CheckoutKind::Branch("acme/widget".into())
+        );
+        // Outside a repo always repo.
+        assert_eq!(
+            classify_checkout_target("acme/widget", None),
+            CheckoutKind::RepoSpec("acme/widget".into())
+        );
+    }
+
+    #[test]
+    fn classify_branch_namespaces_never_repo_while_inside_repo() {
+        let (tmp, primary) = scratch_repo();
+        let cfg = test_cfg(tmp.path());
+        for name in [
+            "feature/login",
+            "task/abc123",
+            "project/d53bd17-multi",
+            "fix/checkout-repo-ensure",
+            "chore/bump",
+        ] {
+            assert_eq!(
+                classify_checkout_target_with_cfg(name, Some(&primary), Some(&cfg)),
+                CheckoutKind::Branch(name.into()),
+                "{name} must be branch"
+            );
+        }
+        let _ = tmp;
+    }
+
+    #[test]
+    fn classify_bare_name_prefers_existing_branch() {
+        let (tmp, primary) = scratch_repo();
+        git(&primary, &["branch", "release"]);
+        assert_eq!(
+            classify_checkout_target("release", Some(&primary)),
+            CheckoutKind::Branch("release".into())
+        );
+        // No such branch → repo spec (owner resolution happens later).
+        assert_eq!(
+            classify_checkout_target("totally-unknown-xyz", Some(&primary)),
+            CheckoutKind::RepoSpec("totally-unknown-xyz".into())
+        );
+        let _ = tmp;
+    }
+
+    /// Seed a bare-compatible remote and provision via ensure_repo_main_worktree_from_url.
+    fn seed_remote_repo(tmp: &Path) -> (PathBuf, String) {
+        let seed = tmp.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init", "-q", "-b", "main"]);
+        git(&seed, &["config", "user.email", "t@t.co"]);
+        git(&seed, &["config", "user.name", "t"]);
+        std::fs::write(seed.join("README"), "hello\n").unwrap();
+        git(&seed, &["add", "README"]);
+        git(&seed, &["commit", "-q", "-m", "init"]);
+        let remote = tmp.join("remote.git");
+        git(
+            tmp,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ],
+        );
+        let url = format!("file://{}", remote.display());
+        (remote, url)
+    }
+
+    #[test]
+    fn ensure_repo_creates_parents_bare_and_main_worktree() {
+        let tmp = tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        // Deliberately do NOT create bareRoot / worktreeRoot first.
+        let (_remote, url) = seed_remote_repo(tmp.path());
+
+        let result =
+            ensure_repo_main_worktree_from_url("acme", "widget", &url, &cfg).expect("ensure");
+        assert!(result.created);
+        assert!(result.path.is_dir());
+        assert!(
+            is_valid_linked_worktree(&result.path, &PathBuf::from(&cfg.bare_root).join("acme").join("widget.git")),
+            "main worktree must have a git connection to the bare"
+        );
+        let inside = Command::new("git")
+            .arg("-C")
+            .arg(&result.path)
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&inside.stdout).trim(), "true");
+        assert!(result.path.join("README").is_file());
+
+        // Reuse: second call does not re-create.
+        let again =
+            ensure_repo_main_worktree_from_url("acme", "widget", &url, &cfg).expect("reuse");
+        assert!(!again.created);
+        assert_eq!(
+            canonicalize_existing(&again.path),
+            canonicalize_existing(&result.path)
+        );
+    }
+
+    #[test]
+    fn ensure_repo_repairs_broken_git_marker_destination() {
+        let tmp = tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let (_remote, url) = seed_remote_repo(tmp.path());
+
+        // Pre-create a destination with only a broken .git pointer (no connection).
+        let dest = PathBuf::from(&cfg.worktree_root)
+            .join("acme")
+            .join("widget")
+            .join("main");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join(".git"), "gitdir: /nonexistent/path\n").unwrap();
+
+        let result =
+            ensure_repo_main_worktree_from_url("acme", "widget", &url, &cfg).expect("repair");
+        assert!(result.created);
+        assert!(is_valid_linked_worktree(
+            &result.path,
+            &PathBuf::from(&cfg.bare_root).join("acme").join("widget.git")
+        ));
+    }
+
+    #[test]
+    fn ensure_repo_recovers_when_directory_missing_but_still_registered() {
+        let tmp = tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let (_remote, url) = seed_remote_repo(tmp.path());
+
+        let first =
+            ensure_repo_main_worktree_from_url("acme", "widget", &url, &cfg).expect("first");
+        assert!(first.path.is_dir());
+        // Out-of-band delete of the worktree files leaves a stale registration.
+        std::fs::remove_dir_all(&first.path).unwrap();
+        assert!(!first.path.exists());
+
+        let again =
+            ensure_repo_main_worktree_from_url("acme", "widget", &url, &cfg).expect("recover");
+        assert!(again.created);
+        assert!(is_valid_linked_worktree(
+            &again.path,
+            &PathBuf::from(&cfg.bare_root).join("acme").join("widget.git")
+        ));
+    }
+
+    #[test]
+    fn ensure_repo_refuses_non_git_content_at_destination() {
+        let tmp = tempdir().unwrap();
+        let cfg = test_cfg(tmp.path());
+        let (_remote, url) = seed_remote_repo(tmp.path());
+
+        // Bare must exist so we hit the worktree path (not bare clone failure).
+        let bare = PathBuf::from(&cfg.bare_root).join("acme").join("widget.git");
+        bare_clone_from_url(&url, &bare).unwrap();
+
+        let dest = PathBuf::from(&cfg.worktree_root)
+            .join("acme")
+            .join("widget")
+            .join("main");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("precious.txt"), "keep me\n").unwrap();
+
+        let err = ensure_repo_main_worktree_from_url("acme", "widget", &url, &cfg)
+            .expect_err("must refuse");
+        assert!(
+            err.contains("no git connection") || err.contains("move or remove"),
+            "err was: {err}"
+        );
+        assert!(dest.join("precious.txt").is_file(), "must not destroy content");
     }
 }
