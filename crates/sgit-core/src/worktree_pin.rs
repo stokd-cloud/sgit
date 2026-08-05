@@ -205,7 +205,7 @@ pub fn discover_bare_repos(bare_root: &Path) -> Vec<PathBuf> {
 
 /// Default hooks version embedded in the pin's reference-transaction script when
 /// installed by sgit (independent of stokd's full hook set version).
-pub const PIN_HOOKS_VERSION: u32 = 6;
+pub const PIN_HOOKS_VERSION: u32 = 7;
 
 /// Subdirectory under the common git dir for sgit-managed pin hooks when no
 /// existing `core.hooksPath` is configured.
@@ -374,6 +374,9 @@ fn collect_bare(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
 ///   * commits / fetches / pulls / merges move a *branch* ref, not `HEAD`
 ///   * detaching `HEAD` to an oid is allowed (rebase, bisect)
 ///   * only `HEAD → ref:refs/heads/<other>` (branch switch) is blocked
+///   * only *this* worktree's own HEAD counts, detected via `$gd/HEAD.lock`, so
+///     creating a sibling worktree with `git worktree add` is never refused
+///     (AX-SGIT-PIN-HEAD-LOCK-SCOPES-ENFORCEMENT)
 pub fn reference_transaction_script(hooks_version: u32) -> String {
     format!(
         r#"#!/bin/sh
@@ -389,7 +392,17 @@ input="$(cat)"
   gd="${{GIT_DIR:-}}"
   [ -z "$gd" ] && gd="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
   marker="$gd/{marker}"
-  if [ -n "$gd" ] && [ -f "$marker" ]; then
+  # Scope enforcement to transactions that mutate *this* worktree's HEAD. A ref
+  # transaction holds `HEAD.lock` in the gitdir it actually writes, so the lock is
+  # present here for an in-place `checkout` and absent for a sibling
+  # `git worktree add` (whose lock lives in <common>/worktrees/<new>/HEAD.lock).
+  # Without this scope the pin refuses `worktree add` run from a pinned worktree:
+  # git hands us the new worktree's HEAD *creation* while the hook runs in the
+  # invoking worktree's gitdir context, and stdin, cwd, GIT_DIR and the whole GIT_*
+  # env are byte-identical to a real branch switch. The transaction's old value is
+  # the null oid in BOTH cases, so it is not a usable discriminator either.
+  # (AX-SGIT-PIN-HEAD-LOCK-SCOPES-ENFORCEMENT)
+  if [ -n "$gd" ] && [ -f "$marker" ] && [ -e "$gd/HEAD.lock" ]; then
     pinned="$(head -n1 "$marker" 2>/dev/null | tr -d '[:space:]')"
     if [ -n "$pinned" ]; then
       printf '%s\n' "$input" | while IFS=' ' read -r _old new ref; do
@@ -443,6 +456,44 @@ mod tests {
             .status
             .success();
         assert!(ok, "git {args:?} failed in {}", dir.display());
+    }
+
+    /// Run git without asserting success; return (succeeded, stderr).
+    fn git_try(dir: &Path, args: &[&str]) -> (bool, String) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// The branch `dir`'s HEAD points at, or `"<detached>"`.
+    fn head_symref(dir: &Path) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["symbolic-ref", "HEAD"])
+            .output()
+            .expect("git runs");
+        if out.status.success() {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        } else {
+            "<detached>".to_string()
+        }
+    }
+
+    /// Install the real pin hook and pin the linked worktree, so the test drives
+    /// the shipped script rather than a copy of it.
+    fn armed_scratch_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let (tmp, primary, wt) = scratch_repo();
+        install_reference_transaction_hook(&primary).expect("hook installs");
+        assert!(write_pin_marker(&wt).unwrap(), "linked worktree must pin");
+        (tmp, primary, wt)
     }
 
     /// Build a repo with a linked worktree on branch `pinned`; return
@@ -569,6 +620,166 @@ mod tests {
                 .trim(),
             "refs/heads/main",
         );
+    }
+
+    /// `git worktree add` invoked from inside a PINNED worktree must succeed.
+    ///
+    /// The hook fires in the *invoking* worktree's gitdir context and is handed the
+    /// *new* worktree's HEAD creation, which is byte-identical to an in-place
+    /// `git checkout <branch>` on stdin, cwd, GIT_DIR and the whole GIT_* env — and
+    /// the old value is the null oid in both cases. Enforcement is therefore scoped
+    /// by `$gd/HEAD.lock`, which only exists in the gitdir the transaction actually
+    /// mutates. (AX-SGIT-PIN-HEAD-LOCK-SCOPES-ENFORCEMENT)
+    #[test]
+    fn worktree_add_from_pinned_worktree_is_allowed() {
+        let (tmp, primary, wt) = armed_scratch_repo();
+        git(&primary, &["branch", "sibling"]);
+        let sibling = tmp.path().join("sibling-wt");
+        let (ok, stderr) = git_try(
+            &wt,
+            &["worktree", "add", "-q", sibling.to_str().unwrap(), "sibling"],
+        );
+        assert!(
+            ok,
+            "worktree add from a pinned worktree must not be refused: {stderr}"
+        );
+        assert_eq!(
+            head_symref(&sibling),
+            "refs/heads/sibling",
+            "the new worktree lands on the requested branch"
+        );
+        assert_eq!(
+            head_symref(&wt),
+            "refs/heads/pinned",
+            "the pinned worktree itself must not have moved"
+        );
+    }
+
+    /// The same add, in the real deployment topology: a *bare* repo whose only
+    /// checkouts are linked worktrees (`/opt/dev/<org>/<repo>.git` plus
+    /// `/opt/worktrees/<org>/<repo>/<branch>`). This is the layout that actually
+    /// refused `git worktree add upstream-main`.
+    /// (AX-SGIT-PIN-HEAD-LOCK-SCOPES-ENFORCEMENT)
+    #[test]
+    fn worktree_add_from_pinned_worktree_of_bare_repo_is_allowed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bare = tmp.path().join("repo.git");
+        let seed = tmp.path().join("seed");
+
+        std::fs::create_dir_all(&seed).unwrap();
+        git(tmp.path(), &["init", "-q", "--bare", bare.to_str().unwrap()]);
+        git(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(&seed, &["init", "-q", "-b", "main"]);
+        git(&seed, &["config", "user.email", "t@t.co"]);
+        git(&seed, &["config", "user.name", "t"]);
+        git(&seed, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git(&seed, &["branch", "upstream-main"]);
+        git(
+            &seed,
+            &["push", "-q", bare.to_str().unwrap(), "main", "upstream-main"],
+        );
+
+        install_reference_transaction_hook(&bare).expect("hook installs");
+        let wt_main = tmp.path().join("main");
+        git(
+            &bare,
+            &["worktree", "add", "-q", wt_main.to_str().unwrap(), "main"],
+        );
+        assert!(
+            write_pin_marker(&wt_main).unwrap(),
+            "the primary linked worktree must pin to main"
+        );
+
+        let wt_upstream = tmp.path().join("upstream-main");
+        let (ok, stderr) = git_try(
+            &wt_main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt_upstream.to_str().unwrap(),
+                "upstream-main",
+            ],
+        );
+        assert!(
+            ok,
+            "adding a sibling worktree from the pinned main worktree must not be refused: {stderr}"
+        );
+        assert_eq!(head_symref(&wt_upstream), "refs/heads/upstream-main");
+        assert_eq!(
+            head_symref(&wt_main),
+            "refs/heads/main",
+            "the pinned main worktree must not have moved"
+        );
+
+        // ...and the pin still holds in that same worktree. Switch to a branch that
+        // is NOT checked out anywhere, so the refusal can only come from the pin —
+        // `upstream-main` would now be rejected by git's own already-checked-out
+        // guard, which would make this assertion pass for the wrong reason.
+        git(&bare, &["branch", "spare", "main"]);
+        let (switched, stderr) = git_try(&wt_main, &["checkout", "-q", "spare"]);
+        assert!(!switched, "the pin must still refuse an in-place switch");
+        assert!(
+            stderr.contains("refusing to move this worktree off"),
+            "the refusal must come from the pin, got: {stderr}"
+        );
+        assert_eq!(head_symref(&wt_main), "refs/heads/main");
+    }
+
+    /// The pin still refuses an in-place branch switch in the pinned worktree.
+    #[test]
+    fn checkout_in_pinned_linked_worktree_is_refused() {
+        let (_tmp, primary, wt) = armed_scratch_repo();
+        git(&primary, &["branch", "other"]);
+        let (ok, stderr) = git_try(&wt, &["checkout", "-q", "other"]);
+        assert!(!ok, "a pinned worktree must refuse a branch switch");
+        assert!(
+            stderr.contains("refusing to move this worktree off"),
+            "refusal must explain itself, got: {stderr}"
+        );
+        assert_eq!(
+            head_symref(&wt),
+            "refs/heads/pinned",
+            "HEAD must be unchanged after a refused switch"
+        );
+    }
+
+    /// Pinning is per-worktree: a second pinned worktree also refuses its own
+    /// switch, and the refusal names *its* branch, not the first worktree's.
+    #[test]
+    fn each_pinned_worktree_enforces_its_own_branch() {
+        let (tmp, primary, wt) = armed_scratch_repo();
+        let second = tmp.path().join("second");
+        git(
+            &wt,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "second",
+                second.to_str().unwrap(),
+            ],
+        );
+        assert!(write_pin_marker(&second).unwrap());
+        git(&primary, &["branch", "other"]);
+        let (ok, stderr) = git_try(&second, &["checkout", "-q", "other"]);
+        assert!(!ok, "the second pinned worktree must refuse its own switch");
+        assert!(
+            stderr.contains("refs/heads/second"),
+            "refusal must name the offending worktree's own pin, got: {stderr}"
+        );
+        assert_eq!(head_symref(&second), "refs/heads/second");
+    }
+
+    /// Detaching HEAD stays allowed — rebase and bisect depend on it, and the
+    /// hook's scope is deliberately narrow.
+    #[test]
+    fn detaching_head_in_pinned_worktree_is_allowed() {
+        let (_tmp, _primary, wt) = armed_scratch_repo();
+        let (ok, stderr) = git_try(&wt, &["checkout", "--detach", "-q"]);
+        assert!(ok, "detaching HEAD must remain allowed: {stderr}");
+        assert_eq!(head_symref(&wt), "<detached>");
     }
 
     #[test]
