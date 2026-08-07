@@ -230,11 +230,11 @@ pub fn sync_branch(
 /// Pure: the trimmed command to run after a land syncs local `main`, or `None`
 /// to skip. Skips when build-on-land is off, the command is blank, or a build is
 /// already in progress.
-pub fn build_on_land_command<'a>(
+pub fn build_on_land_command(
     build_on_land: bool,
-    build_command: &'a str,
+    build_command: &str,
     build_in_progress: bool,
-) -> Option<&'a str> {
+) -> Option<&str> {
     let trimmed = build_command.trim();
     if build_on_land && !trimmed.is_empty() && !build_in_progress {
         Some(trimmed)
