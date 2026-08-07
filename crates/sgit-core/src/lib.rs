@@ -10,6 +10,7 @@ mod config;
 pub mod layout;
 pub mod lock;
 pub mod migrate_ops;
+pub mod pull;
 mod repo_list;
 mod repo_ref;
 pub mod shove;
@@ -55,9 +56,14 @@ pub use repo_ref::{
     describe_owner_resolution_failure, local_owners_for_repo, parse_repo_spec, resolve_owner_chain,
     OwnerResolution, OwnerSource, RepoSpec,
 };
+pub use pull::{
+    classify_pull_strategy, dirty_tracked_paths, pull, PullOptions, PullOutcome, PullStrategy,
+    PULL_BACKUP_PREFIX,
+};
 pub use shove::{
-    shove, shove_backup_branch_names, CapturedGit, CommitOutcome, ConflictContext, ConflictKind,
-    ConflictResolver, PushDecision, ShoveOptions,
+    backup_branch_names, create_backup_branches, shove, shove_backup_branch_names, CapturedGit,
+    CommitOutcome, ConflictContext, ConflictKind, ConflictResolver, PushDecision, ShoveOptions,
+    SHOVE_BACKUP_PREFIX,
 };
 pub use biometric::require_biometric;
 pub use lock::{

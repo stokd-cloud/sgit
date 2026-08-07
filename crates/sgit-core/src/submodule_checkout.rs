@@ -54,9 +54,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::layout::parse_git_remote_url;
 
 /// How submodules are materialized inside a newly created superproject worktree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SubmoduleCheckoutMode {
     /// Do not populate submodule working trees (default).
+    #[default]
     None,
     /// Attach shared linked worktrees from `bareRoot` (or submodule update --init fallback).
     Worktree,
@@ -89,11 +90,6 @@ impl SubmoduleCheckoutMode {
     }
 }
 
-impl Default for SubmoduleCheckoutMode {
-    fn default() -> Self {
-        SubmoduleCheckoutMode::None
-    }
-}
 
 impl Serialize for SubmoduleCheckoutMode {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

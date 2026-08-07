@@ -110,12 +110,15 @@ pub fn classify_checkout_target_with_cfg(
     // remote ensure). CLI falls back to branch create if owner resolution /
     // clone fails while still inside a git repo.
     if let Some((owner, repo)) = trimmed.split_once('/') {
-        if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') {
-            if cfg.map(|c| local_repo_layout_exists(c, trimmed)).unwrap_or(false)
-                || looks_like_owner_repo_pair(owner, repo)
-            {
-                return CheckoutKind::RepoSpec(trimmed.to_string());
-            }
+        if !owner.is_empty()
+            && !repo.is_empty()
+            && !repo.contains('/')
+            && (cfg
+                .map(|c| local_repo_layout_exists(c, trimmed))
+                .unwrap_or(false)
+                || looks_like_owner_repo_pair(owner, repo))
+        {
+            return CheckoutKind::RepoSpec(trimmed.to_string());
         }
     }
 
