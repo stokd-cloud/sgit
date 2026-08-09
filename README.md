@@ -41,24 +41,18 @@ When using the stokd installer surface, `sgit` is also shipped alongside stokd t
 sgit cd owner/repo
 sgit cd owner/repo main
 sgit cd my-repo
+sgit cd gdock upstream-main          # exact leaf
+sgit cd gdock upstream-ag-           # unique prefix partial → e.g. upstream-ag-brand-quad
 ```
 
-**Shell helper `scd`:** source a small function that runs `sgit cd` and `cd`s for you:
+**Leaf resolution order:** exact leaf name (and task/project slug conventions) → **unique prefix partial** among leaf directories → git branch → worktree lookup. Ambiguous prefixes error with the matching candidates listed.
 
-```bash
-# ~/.zshrc or ~/.bashrc
-scd() {
-  local target
-  target="$(sgit cd "$@")" || return $?
-  cd "$target" || return $?
-}
-```
-
-Then:
+**Shell helper `scd`:** the stokd/sgit installer writes `~/.stokd/shell/sgit-cd.sh` (sourced from your shell rc) with `scd` / `sgit` functions that run `sgit cd` and `cd` for you, plus **zsh/bash tab completion** for repo and leaf:
 
 ```bash
 scd owner/repo
 scd owner/repo feature-branch
+scd gdock upstream-ag-<TAB>   # completes leaves under gdock
 ```
 
 `scd` is a thin shell wrapper around `sgit cd`. After the stokd hard-cut, `scd` depends on the `sgit` binary (not on `stokd`).
