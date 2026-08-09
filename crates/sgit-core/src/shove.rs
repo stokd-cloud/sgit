@@ -137,11 +137,9 @@ pub fn shove(
             match simple_commit(repo_root, &commit_msg)? {
                 CommitOutcome::Committed | CommitOutcome::NothingToCommit => {}
                 CommitOutcome::PreCommitFailure => {
-                    return Err(
-                        "git commit failed: pre-commit hook rejected the commit \
+                    return Err("git commit failed: pre-commit hook rejected the commit \
                          (sgit has no agent remediation — fix hooks manually and retry)"
-                            .to_string(),
-                    );
+                        .to_string());
                 }
                 CommitOutcome::HardError => {
                     return Err("git commit failed".to_string());
@@ -287,6 +285,212 @@ pub fn resolve_rebase_conflicts(
     }
     run_git(repo_root, &["add", "-A"])?;
     run_git_rebase_continue(repo_root)?;
+    Ok(())
+}
+
+// ── Unmerged index stages (modify/delete-safe conflict handling) ─────────────
+
+/// How git's index stages classify one unmerged path. Stage data is the only
+/// reliable signal for marker-less structural conflicts such as
+/// modify/delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnmergedKind {
+    BothModified,
+    DeletedByThem,
+    DeletedByUs,
+    BothAdded,
+    AddedByUs,
+    AddedByThem,
+    Other,
+}
+
+impl UnmergedKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BothModified => "both-modified",
+            Self::DeletedByThem => "modify/delete",
+            Self::DeletedByUs => "delete/modify",
+            Self::BothAdded => "add/add",
+            Self::AddedByUs => "added-by-us",
+            Self::AddedByThem => "added-by-them",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn is_structural(self) -> bool {
+        !matches!(self, Self::BothModified)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmergedEntry {
+    pub path: String,
+    pub kind: UnmergedKind,
+}
+
+/// Parse `git ls-files -u` into one classified entry per path, preserving
+/// first-seen order. Each input line is `<mode> <sha> <stage>\t<path>`.
+pub fn parse_unmerged_entries(ls_files_u: &str) -> Vec<UnmergedEntry> {
+    let mut order = Vec::new();
+    let mut stages: std::collections::HashMap<String, [bool; 3]> = std::collections::HashMap::new();
+    for line in ls_files_u.lines() {
+        let Some((meta, path)) = line.split_once('\t') else {
+            continue;
+        };
+        let path = path.trim_end_matches('\r');
+        let Some(stage) = meta
+            .split_whitespace()
+            .next_back()
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if path.is_empty() || !(1..=3).contains(&stage) {
+            continue;
+        }
+        let seen = stages.entry(path.to_string()).or_insert_with(|| {
+            order.push(path.to_string());
+            [false; 3]
+        });
+        seen[stage - 1] = true;
+    }
+    order
+        .into_iter()
+        .map(|path| {
+            let kind = match stages.get(&path).copied().unwrap_or([false; 3]) {
+                [true, true, true] => UnmergedKind::BothModified,
+                [true, true, false] => UnmergedKind::DeletedByThem,
+                [true, false, true] => UnmergedKind::DeletedByUs,
+                [false, true, true] => UnmergedKind::BothAdded,
+                [false, true, false] => UnmergedKind::AddedByUs,
+                [false, false, true] => UnmergedKind::AddedByThem,
+                _ => UnmergedKind::Other,
+            };
+            UnmergedEntry { path, kind }
+        })
+        .collect()
+}
+
+pub fn read_unmerged_entries(repo_root: &Path) -> Vec<UnmergedEntry> {
+    let output = run_git_captured(repo_root, &["-c", "core.quotePath=false", "ls-files", "-u"]);
+    parse_unmerged_entries(&output.stdout)
+}
+
+pub fn unmerged_entry_paths(entries: &[UnmergedEntry]) -> Vec<String> {
+    entries.iter().map(|entry| entry.path.clone()).collect()
+}
+
+/// Marker-bearing content and every structural conflict require an explicit
+/// resolver decision. A marker-less ordinary both-modified entry may be staged
+/// directly when the rebase already materialized its resolution.
+pub fn conflict_round_needs_resolver(entries: &[UnmergedEntry], any_markers: bool) -> bool {
+    any_markers || entries.iter().any(|entry| entry.kind.is_structural())
+}
+
+pub fn summarize_unmerged_kinds(entries: &[UnmergedEntry]) -> String {
+    let mut counts: Vec<(&'static str, usize)> = Vec::new();
+    for entry in entries {
+        let label = entry.kind.label();
+        match counts.iter_mut().find(|(known, _)| *known == label) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((label, 1)),
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(label, count)| format!("{count} {label}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageAction {
+    Add,
+    Remove,
+}
+
+pub fn stage_action_for(path_exists_on_disk: bool) -> StageAction {
+    if path_exists_on_disk {
+        StageAction::Add
+    } else {
+        StageAction::Remove
+    }
+}
+
+fn path_present(repo_root: &Path, path: &str) -> bool {
+    repo_root.join(path).symlink_metadata().is_ok()
+}
+
+pub fn any_conflict_markers_on_disk(repo_root: &Path, files: &[String]) -> bool {
+    files.iter().any(|file| {
+        std::fs::read_to_string(repo_root.join(file))
+            .map(|content| contains_conflict_markers(&content))
+            .unwrap_or(false)
+    })
+}
+
+pub fn verify_conflict_markers_cleared(
+    repo_root: &Path,
+    entries: &[UnmergedEntry],
+) -> Result<(), String> {
+    for entry in entries {
+        if !path_present(repo_root, &entry.path) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(repo_root.join(&entry.path)) else {
+            continue;
+        };
+        if contains_conflict_markers(&content) {
+            return Err(format!(
+                "conflict markers still present in {} after resolution; the operation is left in place so both sides are preserved",
+                entry.path
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Stage exactly the paths from this conflict round. A path the resolver left
+/// absent is recorded as a deletion; blanket `git add -A` would resurrect it
+/// and stage unrelated working-tree state.
+pub fn stage_conflict_resolution(
+    repo_root: &Path,
+    entries: &[UnmergedEntry],
+) -> Result<(), String> {
+    for entry in entries {
+        match stage_action_for(path_present(repo_root, &entry.path)) {
+            StageAction::Add => run_git(repo_root, &["add", "--", &entry.path])?,
+            StageAction::Remove => {
+                let removed = run_git_captured(repo_root, &["rm", "-f", "--", &entry.path]);
+                if !removed.success {
+                    run_git(repo_root, &["rm", "--cached", "-f", "--", &entry.path])?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn verify_conflict_staged(repo_root: &Path, entries: &[UnmergedEntry]) -> Result<(), String> {
+    for entry in entries {
+        let unmerged = run_git_captured(repo_root, &["ls-files", "-u", "--", &entry.path]);
+        if unmerged.success && !unmerged.stdout.trim().is_empty() {
+            return Err(format!(
+                "{} is still unmerged after staging the resolution",
+                entry.path
+            ));
+        }
+        if path_present(repo_root, &entry.path) {
+            continue;
+        }
+        let indexed = run_git_captured(repo_root, &["ls-files", "--", &entry.path]);
+        if indexed.success && !indexed.stdout.trim().is_empty() {
+            return Err(format!(
+                "{} was resolved as deleted but is still present in the index (staging it would resurrect it)",
+                entry.path
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -789,6 +993,38 @@ mod tests {
             parse_unmerged_paths(raw),
             vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
         );
+    }
+
+    #[test]
+    fn parse_unmerged_entries_classifies_structural_conflicts() {
+        let entries = parse_unmerged_entries(
+            "100644 aaa 1\tboth.txt\n\
+             100644 bbb 2\tboth.txt\n\
+             100644 ccc 3\tboth.txt\n\
+             100644 ddd 1\tdeleted.txt\n\
+             100644 eee 2\tdeleted.txt\n\
+             100644 fff 2\tdir/a file.txt\n",
+        );
+        assert_eq!(entries[0].kind, UnmergedKind::BothModified);
+        assert_eq!(entries[1].kind, UnmergedKind::DeletedByThem);
+        assert_eq!(entries[2].path, "dir/a file.txt");
+        assert_eq!(entries[2].kind, UnmergedKind::AddedByUs);
+    }
+
+    #[test]
+    fn structural_conflict_requires_resolver_without_markers() {
+        let text = vec![UnmergedEntry {
+            path: "text".into(),
+            kind: UnmergedKind::BothModified,
+        }];
+        let structural = vec![UnmergedEntry {
+            path: "deleted".into(),
+            kind: UnmergedKind::DeletedByUs,
+        }];
+        assert!(!conflict_round_needs_resolver(&text, false));
+        assert!(conflict_round_needs_resolver(&text, true));
+        assert!(conflict_round_needs_resolver(&structural, false));
+        assert_eq!(stage_action_for(false), StageAction::Remove);
     }
 
     #[test]
