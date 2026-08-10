@@ -145,7 +145,9 @@ impl<'de> Deserialize<'de> for SubmoduleCheckoutConfig {
                 for (k, v) in map {
                     let key = k
                         .as_str()
-                        .ok_or_else(|| serde::de::Error::custom("submoduleCheckout map keys must be strings"))?
+                        .ok_or_else(|| {
+                            serde::de::Error::custom("submoduleCheckout map keys must be strings")
+                        })?
                         .to_string();
                     let mode_str = v.as_str().ok_or_else(|| {
                         serde::de::Error::custom(format!(
@@ -169,10 +171,7 @@ impl<'de> Deserialize<'de> for SubmoduleCheckoutConfig {
 /// Normalize `@Owner/Repo.git` / `owner/repo` → `owner/repo` (lowercase).
 pub fn normalize_repo_slug(owner: &str, repo: &str) -> String {
     let owner = owner.trim().trim_start_matches('@').to_ascii_lowercase();
-    let repo = repo
-        .trim()
-        .trim_end_matches(".git")
-        .to_ascii_lowercase();
+    let repo = repo.trim().trim_end_matches(".git").to_ascii_lowercase();
     format!("{owner}/{repo}")
 }
 
@@ -255,7 +254,9 @@ impl<'de> Deserialize<'de> for ChildModeSpec {
                     .get(serde_yaml::Value::String("mode".into()))
                     .ok_or_else(|| serde::de::Error::custom("child entry requires 'mode'"))?;
                 let mode_str = mode_val.as_str().ok_or_else(|| {
-                    serde::de::Error::custom("child.mode must be a string (none|worktree|inline|link)")
+                    serde::de::Error::custom(
+                        "child.mode must be a string (none|worktree|inline|link)",
+                    )
                 })?;
                 let mode =
                     SubmoduleCheckoutMode::parse(mode_str).map_err(serde::de::Error::custom)?;
@@ -298,10 +299,10 @@ impl RepoSubmodulesFile {
         if !path.is_file() {
             return Ok(None);
         }
-        let text = fs::read_to_string(&path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
-        let file: Self = serde_yaml::from_str(&text)
-            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        let text =
+            fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let file: Self =
+            serde_yaml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
         Ok(Some(file))
     }
 
@@ -393,17 +394,18 @@ fn parse_gitmodules(text: &str) -> Vec<SubmoduleEntry> {
     let mut url = String::new();
     let mut in_sub = false;
 
-    let flush = |out: &mut Vec<SubmoduleEntry>, name: &mut String, path: &mut String, url: &mut String| {
-        if !name.is_empty() && !path.is_empty() {
-            out.push(SubmoduleEntry {
-                path: path.clone(),
-                url: url.clone(),
-            });
-        }
-        name.clear();
-        path.clear();
-        url.clear();
-    };
+    let flush =
+        |out: &mut Vec<SubmoduleEntry>, name: &mut String, path: &mut String, url: &mut String| {
+            if !name.is_empty() && !path.is_empty() {
+                out.push(SubmoduleEntry {
+                    path: path.clone(),
+                    url: url.clone(),
+                });
+            }
+            name.clear();
+            path.clear();
+            url.clear();
+        };
 
     for line in text.lines() {
         let line = line.trim();
@@ -544,13 +546,11 @@ fn materialize_one_submodule(
         SubmoduleCheckoutMode::Inline => inline_one_submodule(worktree_dir, entry),
         // Symlink to the canonical shared checkout; fall back to inline when
         // no canonical checkout exists (or on non-unix).
-        SubmoduleCheckoutMode::Link => {
-            match link_one_submodule(worktree_dir, bare_root, entry) {
-                Ok(true) => Ok(()),
-                Ok(false) => inline_one_submodule(worktree_dir, entry),
-                Err(e) => Err(e),
-            }
-        }
+        SubmoduleCheckoutMode::Link => match link_one_submodule(worktree_dir, bare_root, entry) {
+            Ok(true) => Ok(()),
+            Ok(false) => inline_one_submodule(worktree_dir, entry),
+            Err(e) => Err(e),
+        },
         // Attach a linked worktree of the matching bare; inline fallback otherwise.
         SubmoduleCheckoutMode::Worktree => {
             let commit = gitlink_commit(worktree_dir, &entry.path);
@@ -625,11 +625,7 @@ fn link_one_submodule(
     }
     // Keep the symlinked gitlink from ever dirtying the superproject.
     let _ = Command::new("git")
-        .args([
-            "config",
-            &format!("submodule.{}.ignore", entry.path),
-            "all",
-        ])
+        .args(["config", &format!("submodule.{}.ignore", entry.path), "all"])
         .current_dir(worktree_dir)
         .output();
     let _ = Command::new("git")
@@ -801,7 +797,11 @@ mod tests {
             ("symlink", SubmoduleCheckoutMode::Link),
             ("shared", SubmoduleCheckoutMode::Link),
         ] {
-            assert_eq!(SubmoduleCheckoutMode::parse(raw).unwrap(), want, "raw={raw}");
+            assert_eq!(
+                SubmoduleCheckoutMode::parse(raw).unwrap(),
+                want,
+                "raw={raw}"
+            );
         }
         // Round-trip through as_str().
         for m in [
@@ -872,10 +872,7 @@ mod tests {
     #[test]
     fn resolve_map_matches_at_owner_repo() {
         let mut map = BTreeMap::new();
-        map.insert(
-            "@stokd-cloud/mono".into(),
-            SubmoduleCheckoutMode::Worktree,
-        );
+        map.insert("@stokd-cloud/mono".into(), SubmoduleCheckoutMode::Worktree);
         map.insert("@other/repo".into(), SubmoduleCheckoutMode::None);
         let cfg = SubmoduleCheckoutConfig::PerRepo(map);
         assert_eq!(
@@ -891,10 +888,7 @@ mod tests {
     #[test]
     fn resolve_map_normalizes_case_and_git_suffix() {
         let mut map = BTreeMap::new();
-        map.insert(
-            "@Owner/Repo.git".into(),
-            SubmoduleCheckoutMode::None,
-        );
+        map.insert("@Owner/Repo.git".into(), SubmoduleCheckoutMode::None);
         let cfg = SubmoduleCheckoutConfig::PerRepo(map);
         assert_eq!(
             resolve_submodule_checkout(&cfg, "owner", "repo"),
@@ -1153,7 +1147,12 @@ children:
         let bare = bare_root.join("acme").join("widget.git");
         fs::create_dir_all(bare.parent().unwrap()).unwrap();
         let o = Command::new("git")
-            .args(["clone", "--bare", &sub_src.to_string_lossy(), &bare.to_string_lossy()])
+            .args([
+                "clone",
+                "--bare",
+                &sub_src.to_string_lossy(),
+                &bare.to_string_lossy(),
+            ])
             .output()
             .unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -1240,7 +1239,12 @@ children:
         git(&["add", "."], &src);
         git(&["commit", "-m", "c"], &src);
         let o = Command::new("git")
-            .args(["clone", "--bare", &src.to_string_lossy(), &bare.to_string_lossy()])
+            .args([
+                "clone",
+                "--bare",
+                &src.to_string_lossy(),
+                &bare.to_string_lossy(),
+            ])
             .output()
             .unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -1320,7 +1324,12 @@ children:
         let bare = bare_root.join("acme").join("widget.git");
         fs::create_dir_all(bare.parent().unwrap()).unwrap();
         let o = Command::new("git")
-            .args(["clone", "--bare", &sub_src.to_string_lossy(), &bare.to_string_lossy()])
+            .args([
+                "clone",
+                "--bare",
+                &sub_src.to_string_lossy(),
+                &bare.to_string_lossy(),
+            ])
             .output()
             .unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -1355,10 +1364,16 @@ children:
 
         let dest = super_repo.join("nested");
         assert!(
-            fs::symlink_metadata(&dest).unwrap().file_type().is_symlink(),
+            fs::symlink_metadata(&dest)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
             "link mode must create a symlink at the submodule path"
         );
-        assert!(dest.join("marker.txt").is_file(), "symlink must resolve to the checkout");
+        assert!(
+            dest.join("marker.txt").is_file(),
+            "symlink must resolve to the checkout"
+        );
 
         let status = Command::new("git")
             .args(["status", "--porcelain"])

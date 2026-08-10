@@ -175,9 +175,9 @@ fn scan(announce: bool, filter: &MigrateFilter) -> ScanResult {
 
     // The launch directory is a scan root too — unless it already lives
     // inside one of the configured roots (then its contents are covered).
-    let cwd = std::env::current_dir().ok().filter(|c| {
-        !path_is_under(c, &worktree_root) && !path_is_under(c, &bare_root)
-    });
+    let cwd = std::env::current_dir()
+        .ok()
+        .filter(|c| !path_is_under(c, &worktree_root) && !path_is_under(c, &bare_root));
 
     if announce {
         match &cwd {
@@ -308,9 +308,7 @@ fn scan_roots(
             .and_then(|admin| bare_from_admin_dir(admin))
         {
             Some(bare_path) => groups.entry(bare_path).or_default().push(wt),
-            None if wt.git_is_dir && wt.origin_owner_repo.is_some() => {
-                standalone_clones.push(wt)
-            }
+            None if wt.git_is_dir && wt.origin_owner_repo.is_some() => standalone_clones.push(wt),
             None => orphans.push(wt),
         }
     }
@@ -386,7 +384,9 @@ fn scan_roots(
             if already_known {
                 continue;
             }
-            group.worktrees.push(inspect_worktree(&reg, &reg.join(".git")));
+            group
+                .worktrees
+                .push(inspect_worktree(&reg, &reg.join(".git")));
         }
     }
 
@@ -457,12 +457,7 @@ fn walk_bare_root(root: &Path, exclude: &[&Path]) -> BareRootScan {
 /// git content (they are stranded among repos) or by the scan root — so an
 /// entirely git-less tree is reported once at its topmost directory, not once
 /// per descendant.
-fn walk_bare_dir(
-    dir: &Path,
-    exclude: &[&Path],
-    depth: usize,
-    scan: &mut BareRootScan,
-) -> bool {
+fn walk_bare_dir(dir: &Path, exclude: &[&Path], depth: usize, scan: &mut BareRootScan) -> bool {
     if depth > MAX_BARE_WALK_DEPTH {
         return false;
     }
@@ -1100,8 +1095,8 @@ fn inspect_worktree(path: &Path, git_marker: &Path) -> Worktree {
 
     // Trim the trailing newline so branch comparisons (e.g. "main"/"master")
     // and the rendered canonical leaf match — `git` output ends in `\n`.
-    let branch = run_git_capture(path, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .map(|s| s.trim().to_string());
+    let branch =
+        run_git_capture(path, &["rev-parse", "--abbrev-ref", "HEAD"]).map(|s| s.trim().to_string());
     let dirty = run_git_capture(path, &["status", "--porcelain"]).map(|s| !s.trim().is_empty());
     let unpushed = if branch.is_some() {
         // log @{u}.. fails if there's no upstream; we treat that as "unknown".
@@ -1259,10 +1254,7 @@ fn classify_existing_bare(clone: &Path, bare: &Path) -> ExistingBare {
         return ExistingBare::Salvage;
     }
     // A valid bare whose origin differs from the clone's is someone else's repo.
-    if let (Some(c), Some(b)) = (
-        bare_remote_owner_repo(clone),
-        bare_remote_owner_repo(bare),
-    ) {
+    if let (Some(c), Some(b)) = (bare_remote_owner_repo(clone), bare_remote_owner_repo(bare)) {
         if c != b {
             return ExistingBare::Foreign;
         }
@@ -1286,10 +1278,16 @@ fn classify_existing_bare(clone: &Path, bare: &Path) -> ExistingBare {
 /// and suffixing `.partial-N` so repeated salvages never collide.
 /// (AX-CLI-REPO-MIGRATE-RECONSTRUCT-RESUMABLE)
 fn partial_bare_trash_path(bare: &Path) -> PathBuf {
-    let file = bare.file_name().map(std::ffi::OsString::from).unwrap_or_default();
+    let file = bare
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_default();
     // Canonical layout is <bareRoot>/<owner>/<repo>.git; fall back to a sibling
     // trash dir when the bare is not two levels deep.
-    let base = match (bare.parent().and_then(Path::parent), bare.parent().and_then(Path::file_name)) {
+    let base = match (
+        bare.parent().and_then(Path::parent),
+        bare.parent().and_then(Path::file_name),
+    ) {
         (Some(root), Some(owner)) => root.join(".stokd-migrate-trash").join(owner),
         _ => bare
             .parent()
@@ -1339,7 +1337,18 @@ fn resume_reconstruct(clone: &Path, bare: &Path, worktree: &Path) -> ApplyStatus
     // fall back to the bare's local main/master.
     let branch = run_git_capture(clone, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map(|s| s.trim().to_string())
-        .filter(|b| !b.is_empty() && git_ok_status(bare, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{b}")]))
+        .filter(|b| {
+            !b.is_empty()
+                && git_ok_status(
+                    bare,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        &format!("refs/heads/{b}"),
+                    ],
+                )
+        })
         .or_else(|| bare_local_main_branch(bare));
     let Some(branch) = branch else {
         return ApplyStatus::Failed(format!(
@@ -1571,9 +1580,10 @@ fn plan_materialize_main(
     if group.bare.attached_clone.is_some() {
         return None;
     }
-    let has_main_worktree = group.worktrees.iter().any(|wt| {
-        matches!(wt.branch.as_deref(), Some("main") | Some("master"))
-    });
+    let has_main_worktree = group
+        .worktrees
+        .iter()
+        .any(|wt| matches!(wt.branch.as_deref(), Some("main") | Some("master")));
     if has_main_worktree {
         return None;
     }
@@ -1599,10 +1609,19 @@ fn plan_materialize_main(
 /// `main_worktree_name` pattern (matching `repo open`/`repo list`); any other
 /// branch keeps its own name, with `/` flattened to `-` so the leaf is a single
 /// directory under `<root>/<owner>/<repo>/`.
-fn reconstruct_leaf(branch: Option<&str>, owner: &str, repo: &str, main_worktree_name: &str) -> String {
+fn reconstruct_leaf(
+    branch: Option<&str>,
+    owner: &str,
+    repo: &str,
+    main_worktree_name: &str,
+) -> String {
     let b = branch.map(str::trim).unwrap_or("");
     if b.is_empty() || b == "HEAD" || b == "main" || b == "master" {
-        let effective = if b == "main" || b == "master" { b } else { "main" };
+        let effective = if b == "main" || b == "master" {
+            b
+        } else {
+            "main"
+        };
         render_worktree_name_pattern(main_worktree_name, owner, repo, effective)
     } else {
         b.replace('/', "-")
@@ -1666,11 +1685,16 @@ fn build_migration_plan(
         .filter_map(|wt| plan_reconstruct(wt, bare_root, worktree_root, main_worktree_name))
         .collect();
     reconstruct.sort_by(|a, b| {
-        (a.owner.to_lowercase(), a.repo.to_lowercase(), a.clone.clone()).cmp(&(
-            b.owner.to_lowercase(),
-            b.repo.to_lowercase(),
-            b.clone.clone(),
-        ))
+        (
+            a.owner.to_lowercase(),
+            a.repo.to_lowercase(),
+            a.clone.clone(),
+        )
+            .cmp(&(
+                b.owner.to_lowercase(),
+                b.repo.to_lowercase(),
+                b.clone.clone(),
+            ))
     });
 
     let mut plan = MigrationPlan {
@@ -1743,11 +1767,20 @@ fn load_cached_plan() -> Option<MigrationPlan> {
 /// unknown-remote items never become an action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrateAction {
-    MoveWorktree { from: PathBuf, to: PathBuf },
-    MoveBare { from: PathBuf, to: PathBuf },
+    MoveWorktree {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    MoveBare {
+        from: PathBuf,
+        to: PathBuf,
+    },
     /// Remove a redundant bare's clean worktree (reproducible from the winner).
     /// (AX-CLI-REPO-MIGRATE-CONSOLIDATE-DUPLICATE-BARES)
-    DropWorktree { worktree: PathBuf, bare: PathBuf },
+    DropWorktree {
+        worktree: PathBuf,
+        bare: PathBuf,
+    },
     /// Mirror a redundant bare's branches into the winner, then move the
     /// redundant bare to recoverable trash.
     /// (AX-CLI-REPO-MIGRATE-CONSOLIDATE-DUPLICATE-BARES)
@@ -1820,9 +1853,11 @@ pub fn group_actions(group: &PlanGroup) -> Vec<MigrateAction> {
     // strands the clone's working files with no git metadata. The clone is
     // adopted whole by its ReconstructBare entry instead.
     if !group.bare.at_canonical && group.bare.attached_clone.is_none() {
-        if let (Some(to), Some(_), Some(_)) =
-            (&group.bare.canonical_path, &group.bare.owner, &group.bare.repo)
-        {
+        if let (Some(to), Some(_), Some(_)) = (
+            &group.bare.canonical_path,
+            &group.bare.owner,
+            &group.bare.repo,
+        ) {
             actions.push(MigrateAction::MoveBare {
                 from: group.bare.path.clone(),
                 to: to.clone(),
@@ -1936,7 +1971,10 @@ pub(crate) struct WorktreeRepairTarget {
 impl WorktreeRepairTarget {
     #[allow(dead_code)]
     pub(crate) fn healthy(path: PathBuf) -> Self {
-        Self { path, broken: false }
+        Self {
+            path,
+            broken: false,
+        }
     }
 }
 
@@ -1976,7 +2014,9 @@ fn action_dest(action: &MigrateAction) -> Option<&Path> {
 /// (AX-CLI-REPO-MIGRATE-APPLY-SAFE) This is the guard that prevents the migrator
 /// from overwriting an existing repo, collapsing two repos into one destination,
 /// or moving a directory into its own subtree.
-fn preflight(actions: &[MigrateAction]) -> (Vec<MigrateAction>, Vec<(MigrateAction, UnsafeReason)>) {
+fn preflight(
+    actions: &[MigrateAction],
+) -> (Vec<MigrateAction>, Vec<(MigrateAction, UnsafeReason)>) {
     // Count how many actions target each destination so duplicates can be caught.
     // Destructive worktree drops have no destination and never participate.
     let mut dest_counts: BTreeMap<PathBuf, usize> = BTreeMap::new();
@@ -2119,7 +2159,10 @@ struct ClusterFacts {
 enum ClusterResolution {
     /// One bare (the winner) contains every other member and the others are
     /// clean — auto-consolidate, retiring the redundant members.
-    Consolidate { winner: usize, redundant: Vec<usize> },
+    Consolidate {
+        winner: usize,
+        redundant: Vec<usize>,
+    },
     /// The bares cannot be losslessly collapsed automatically.
     Divergent,
 }
@@ -2210,7 +2253,10 @@ fn render_duplicate_bares_section(clusters: &[DuplicateCluster]) -> String {
 /// branches — so containment of a synthetic/unreadable bare degrades to
 /// "unknown" and the caller treats the cluster as divergent (safe).
 fn bare_branch_heads(bare: &Path) -> Option<Vec<String>> {
-    let out = run_git_capture(bare, &["for-each-ref", "--format=%(objectname)", "refs/heads"])?;
+    let out = run_git_capture(
+        bare,
+        &["for-each-ref", "--format=%(objectname)", "refs/heads"],
+    )?;
     Some(
         out.lines()
             .map(str::trim)
@@ -2224,13 +2270,14 @@ fn bare_branch_heads(bare: &Path) -> Option<Vec<String>> {
 /// `bare`'s own branch tips (`bare_heads`). Presence alone is not enough — an
 /// object can linger unreferenced — so we require ancestry from a live ref.
 fn bare_reachable(bare: &Path, bare_heads: &[String], sha: &str) -> bool {
-    let present = run_git_capture(bare, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_some();
+    let present =
+        run_git_capture(bare, &["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_some();
     if !present {
         return false;
     }
-    bare_heads.iter().any(|h| {
-        run_git_capture(bare, &["merge-base", "--is-ancestor", sha, h]).is_some()
-    })
+    bare_heads
+        .iter()
+        .any(|h| run_git_capture(bare, &["merge-base", "--is-ancestor", sha, h]).is_some())
 }
 
 /// Gather the per-bare facts for one collision cluster via git. Returns `None`
@@ -2252,7 +2299,11 @@ fn collect_cluster_facts(idxs: &[usize], plan: &MigrationPlan) -> Option<Cluster
     let members = (0..n)
         .map(|i| {
             let contains = (0..n)
-                .map(|j| heads[j].iter().all(|s| bare_reachable(&paths[i], &heads[i], s)))
+                .map(|j| {
+                    heads[j]
+                        .iter()
+                        .all(|s| bare_reachable(&paths[i], &heads[i], s))
+                })
                 .collect();
             MemberFacts {
                 at_canonical: at_canon[i],
@@ -2291,8 +2342,10 @@ fn resolve_bare_collisions(plan: &mut MigrationPlan) {
                 b.repo.clone().unwrap_or_default()
             )
         };
-        let member_paths: Vec<PathBuf> =
-            idxs.iter().map(|&gi| plan.groups[gi].bare.path.clone()).collect();
+        let member_paths: Vec<PathBuf> = idxs
+            .iter()
+            .map(|&gi| plan.groups[gi].bare.path.clone())
+            .collect();
 
         let resolution = collect_cluster_facts(&idxs, plan)
             .map(|f| classify_bare_cluster(&f))
@@ -2302,7 +2355,11 @@ fn resolve_bare_collisions(plan: &mut MigrationPlan) {
             ClusterResolution::Consolidate { winner, redundant } => {
                 let winner_gi = idxs[winner];
                 let winner_bare = plan.groups[winner_gi].bare.path.clone();
-                let owner = plan.groups[winner_gi].bare.owner.clone().unwrap_or_default();
+                let owner = plan.groups[winner_gi]
+                    .bare
+                    .owner
+                    .clone()
+                    .unwrap_or_default();
                 let repo = plan.groups[winner_gi].bare.repo.clone().unwrap_or_default();
                 plan.groups[winner_gi].role = ConsolidationRole::Winner;
                 for (k, &ri) in redundant.iter().enumerate() {
@@ -2428,10 +2485,7 @@ fn dedupe_bare_destinations(plan: &mut MigrationPlan) {
 /// (`git worktree move`), then a selected bare move relocates the bare and runs
 /// `git worktree repair` over the group's final worktree paths so every link is
 /// fixed — including worktrees that were not themselves moved.
-fn apply_plan(
-    plan: &MigrationPlan,
-    selected: &[MigrateAction],
-) -> Vec<ApplyResult> {
+fn apply_plan(plan: &MigrationPlan, selected: &[MigrateAction]) -> Vec<ApplyResult> {
     // Pre-flight: never mutate the filesystem for an unsafe action. Rejected
     // actions are reported as Skipped and excluded from execution.
     let (safe, rejected) = preflight(selected);
@@ -2580,8 +2634,10 @@ fn apply_plan(
         } = action
         {
             let status = reconstruct_bare(clone, bare, worktree, branch.as_deref());
-            if matches!(status, ApplyStatus::Moved | ApplyStatus::MovedWithWarnings(_))
-                && worktree.exists()
+            if matches!(
+                status,
+                ApplyStatus::Moved | ApplyStatus::MovedWithWarnings(_)
+            ) && worktree.exists()
             {
                 relocate_session_history(clone, worktree);
             }
@@ -2604,11 +2660,7 @@ fn relocate_session_history(_from: &Path, _to: &Path) {
 /// Create the canonical main worktree from the bare: `git worktree add
 /// <worktree> <branch>`. Additive — it never touches an existing directory
 /// (preflight rejects an existing destination before this runs).
-pub(crate) fn materialize_main_worktree(
-    bare: &Path,
-    worktree: &Path,
-    branch: &str,
-) -> ApplyStatus {
+pub(crate) fn materialize_main_worktree(bare: &Path, worktree: &Path, branch: &str) -> ApplyStatus {
     if worktree.exists() {
         return ApplyStatus::Skipped(UnsafeReason::DestinationExists);
     }
@@ -2689,18 +2741,33 @@ fn drop_worktree(bare: &Path, worktree: &Path) -> ApplyStatus {
 /// (AX-CLI-REPO-MIGRATE-CONSOLIDATE-DUPLICATE-BARES)
 fn retire_bare(redundant: &Path, winner: &Path, trash: &Path) -> ApplyStatus {
     if trash.exists() {
-        return ApplyStatus::Failed(format!("trash destination already exists: {}", trash.display()));
+        return ApplyStatus::Failed(format!(
+            "trash destination already exists: {}",
+            trash.display()
+        ));
     }
     let mut warnings = Vec::new();
 
     // Mirror redundant-only branch names into the winner so nothing is lost.
-    let winner_branches: std::collections::HashSet<String> =
-        run_git_capture(winner, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])
-            .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
-            .unwrap_or_default();
-    if let Some(out) =
-        run_git_capture(redundant, &["for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads"])
-    {
+    let winner_branches: std::collections::HashSet<String> = run_git_capture(
+        winner,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )
+    .map(|s| {
+        s.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    })
+    .unwrap_or_default();
+    if let Some(out) = run_git_capture(
+        redundant,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short) %(objectname)",
+            "refs/heads",
+        ],
+    ) {
         for line in out.lines() {
             let mut parts = line.split_whitespace();
             let (Some(name), Some(sha)) = (parts.next(), parts.next()) else {
@@ -3076,7 +3143,12 @@ fn reconstruct_bare(
     // Snapshot the original HEAD so rollback can rebuild the standalone clone.
     let orig_head = fs::read_to_string(bare.join("HEAD")).ok();
     let git_config = |args: &[&str]| {
-        let _ = Command::new("git").arg("-C").arg(bare).arg("config").args(args).output();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(bare)
+            .arg("config")
+            .args(args)
+            .output();
     };
     let restore_clone = || {
         // Undo the bare-ification and move the git dir back under the clone.
@@ -3225,10 +3297,7 @@ fn reconstruct_bare(
 /// randomness — `Math.random`/clock are unavailable in some runtimes) and
 /// collision-checked by the caller.
 fn staging_path(dir: &Path) -> PathBuf {
-    let name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("repo");
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("repo");
     let parent = dir.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!(".{name}.stokd-migrate-staging"))
 }
@@ -3931,7 +4000,9 @@ mod tests {
             plan.reconstruct
         );
         assert!(
-            plan.groups.iter().any(|g| same_path(&g.bare.path, &parked_bare)),
+            plan.groups
+                .iter()
+                .any(|g| same_path(&g.bare.path, &parked_bare)),
             "bare parked under the cwd must be discovered"
         );
 
@@ -3939,7 +4010,10 @@ mod tests {
         // worktree top even though the walk only inspects children.
         let plan2 = scan_to_plan_with_cwd(&bare_root, &worktree_root, Some(&clone), 60);
         assert!(
-            plan2.reconstruct.iter().any(|r| same_path(&r.clone, &clone)),
+            plan2
+                .reconstruct
+                .iter()
+                .any(|r| same_path(&r.clone, &clone)),
             "the enclosing repo of the cwd must be adopted: {:?}",
             plan2.reconstruct
         );
@@ -4099,7 +4173,10 @@ mod tests {
         let linked = worktree_root.join("acme").join("widgets").join("feat");
         fs::create_dir_all(linked.parent().unwrap()).unwrap();
         let linked_s = linked.to_string_lossy().into_owned();
-        git_ok(&clone, &["worktree", "add", "-b", "feat", &linked_s, "main"]);
+        git_ok(
+            &clone,
+            &["worktree", "add", "-b", "feat", &linked_s, "main"],
+        );
 
         let plan = scan_to_plan(&bare_root, &worktree_root, 60);
         let group = plan
@@ -4399,7 +4476,10 @@ mod tests {
         };
 
         // Space on the header selects every action.
-        assert_eq!(handle_key(&mut picker, KeyCode::Char(' ')), PickerOutcome::Continue);
+        assert_eq!(
+            handle_key(&mut picker, KeyCode::Char(' ')),
+            PickerOutcome::Continue
+        );
         assert!(picker.groups[0].actions.iter().all(|a| a.selected));
         assert_eq!(picker.selected_actions().len(), 3);
 
@@ -4418,7 +4498,10 @@ mod tests {
                 header: "acme/a".to_string(),
                 expanded: true,
                 actions: vec![
-                    UiAction { selected: true, ..ui_action("sel") },
+                    UiAction {
+                        selected: true,
+                        ..ui_action("sel")
+                    },
                     ui_action("unsel"),
                 ],
             }],
@@ -4487,7 +4570,10 @@ mod tests {
             .args(["status", "--porcelain"])
             .output()
             .unwrap();
-        assert!(status.status.success(), "git status must work in moved worktree");
+        assert!(
+            status.status.success(),
+            "git status must work in moved worktree"
+        );
     }
 
     // ── AC7: apply relocates a bare and repairs links ────────────────────────
@@ -4624,7 +4710,10 @@ mod tests {
         let status = move_worktree(&bare, &src, &dst);
         assert_eq!(status, ApplyStatus::Moved);
         assert!(!src.exists());
-        assert_eq!(fs::read_to_string(dst.join("README.md")).unwrap(), "changed");
+        assert_eq!(
+            fs::read_to_string(dst.join("README.md")).unwrap(),
+            "changed"
+        );
         assert_eq!(
             fs::read_to_string(dst.join("untracked.txt")).unwrap(),
             "new"
@@ -4740,7 +4829,10 @@ mod tests {
             ),
             "nested bare move should succeed, got {status:?}"
         );
-        assert!(nested_dest.exists(), "bare must now live at the nested dest");
+        assert!(
+            nested_dest.exists(),
+            "bare must now live at the nested dest"
+        );
         // The worktree still resolves to the relocated bare after repair.
         let out = Command::new("git")
             .arg("-C")
@@ -4767,7 +4859,10 @@ mod tests {
 
         let healthy = worktree_root.join("owner").join("repo").join("repo-main");
         fs::create_dir_all(healthy.parent().unwrap()).unwrap();
-        git_ok(&bare, &["worktree", "add", &healthy.to_string_lossy(), "main"]);
+        git_ok(
+            &bare,
+            &["worktree", "add", &healthy.to_string_lossy(), "main"],
+        );
 
         let dest = bare_root.join("moved").join("repo.git");
         let broken_path = worktree_root.join("owner").join("repo").join("ghost");
@@ -4915,15 +5010,15 @@ mod tests {
 
         let dest0 = plan.groups[0].bare.canonical_path.clone().unwrap();
         let dest1 = plan.groups[1].bare.canonical_path.clone().unwrap();
-        assert_ne!(dest0, dest1, "colliding bares must get distinct destinations");
+        assert_ne!(
+            dest0, dest1,
+            "colliding bares must get distinct destinations"
+        );
         assert_eq!(dest0, PathBuf::from("/b/owner/repo.git"));
         assert_eq!(dest1, PathBuf::from("/b/owner/repo-2.git"));
 
         // The loser's worktree follows its bare under the suffixed worktree dir.
-        let wt1 = plan.groups[1].worktrees[0]
-            .canonical_path
-            .clone()
-            .unwrap();
+        let wt1 = plan.groups[1].worktrees[0].canonical_path.clone().unwrap();
         assert_eq!(wt1, PathBuf::from("/w/owner/repo-2/b"));
 
         // No two final destinations (bare or worktree) collide.
@@ -5016,7 +5111,10 @@ mod tests {
         );
         // master branch also maps through the pattern.
         let wt_master = main_worktree("/w/o/r/r-main", "master");
-        assert_eq!(pick_canonical_leaf(&wt_master, "o", "r", "{branch}"), "master");
+        assert_eq!(
+            pick_canonical_leaf(&wt_master, "o", "r", "{branch}"),
+            "master"
+        );
         // A non-main branch preserves its existing leaf.
         let feat = main_worktree("/w/stray/task-foo", "task-foo");
         assert_eq!(pick_canonical_leaf(&feat, "o", "r", "{branch}"), "task-foo");
@@ -5567,10 +5665,16 @@ mod tests {
         // A's main worktree already canonical; B's main worktree off-canonical.
         let wt_a = worktree_root.join("owner").join("repo").join("main");
         fs::create_dir_all(wt_a.parent().unwrap()).unwrap();
-        git_ok(&bare_a, &["worktree", "add", &wt_a.to_string_lossy(), "main"]);
+        git_ok(
+            &bare_a,
+            &["worktree", "add", &wt_a.to_string_lossy(), "main"],
+        );
         let wt_b = worktree_root.join("stray").join("repo-b");
         fs::create_dir_all(wt_b.parent().unwrap()).unwrap();
-        git_ok(&bare_b, &["worktree", "add", &wt_b.to_string_lossy(), "main"]);
+        git_ok(
+            &bare_b,
+            &["worktree", "add", &wt_b.to_string_lossy(), "main"],
+        );
 
         let plan = scan_to_plan(&bare_root, &worktree_root, 60);
         assert!(
@@ -5597,7 +5701,10 @@ mod tests {
             .join(".stokd-migrate-trash")
             .join("owner")
             .join("repo-2.git");
-        assert!(trash.exists(), "redundant bare must move to recoverable trash");
+        assert!(
+            trash.exists(),
+            "redundant bare must move to recoverable trash"
+        );
         assert!(!bare_b.exists(), "old redundant bare path must be gone");
         assert!(
             !bare_root.join("owner").join("repo-2.git").exists(),
@@ -5613,7 +5720,10 @@ mod tests {
             .args(["status", "--porcelain"])
             .output()
             .unwrap();
-        assert!(st.status.success(), "winner worktree must still be functional");
+        assert!(
+            st.status.success(),
+            "winner worktree must still be functional"
+        );
     }
 
     #[test]
@@ -5641,7 +5751,10 @@ mod tests {
         // worktree is off-canonical and must move into it.
         let wt_sub = worktree_root.join("owner").join("repo").join("main");
         fs::create_dir_all(wt_sub.parent().unwrap()).unwrap();
-        git_ok(&bare_sub, &["worktree", "add", &wt_sub.to_string_lossy(), "main"]);
+        git_ok(
+            &bare_sub,
+            &["worktree", "add", &wt_sub.to_string_lossy(), "main"],
+        );
         let wt_super = worktree_root.join("stray").join("repo-super");
         fs::create_dir_all(wt_super.parent().unwrap()).unwrap();
         git_ok(
@@ -5676,7 +5789,10 @@ mod tests {
         // The winner (superset, holding c2) now lives at the canonical bare path,
         // and the redundant subset is in trash.
         let canonical_bare = bare_root.join("owner").join("repo.git");
-        assert!(canonical_bare.exists(), "winner must occupy canonical bare path");
+        assert!(
+            canonical_bare.exists(),
+            "winner must occupy canonical bare path"
+        );
         assert!(
             !bare_super.exists(),
             "winner's old off-canonical path must be gone"
@@ -5729,10 +5845,16 @@ mod tests {
 
         let wt_a = worktree_root.join("owner").join("repo").join("main");
         fs::create_dir_all(wt_a.parent().unwrap()).unwrap();
-        git_ok(&bare_a, &["worktree", "add", &wt_a.to_string_lossy(), "main"]);
+        git_ok(
+            &bare_a,
+            &["worktree", "add", &wt_a.to_string_lossy(), "main"],
+        );
         let wt_b = worktree_root.join("stray").join("repo-b");
         fs::create_dir_all(wt_b.parent().unwrap()).unwrap();
-        git_ok(&bare_b, &["worktree", "add", &wt_b.to_string_lossy(), "main"]);
+        git_ok(
+            &bare_b,
+            &["worktree", "add", &wt_b.to_string_lossy(), "main"],
+        );
 
         // Winner has no `feat` before consolidation.
         assert!(run_git_capture(&bare_a, &["rev-parse", "--verify", "feat"]).is_none());
@@ -5782,10 +5904,16 @@ mod tests {
 
         let wt_a = worktree_root.join("owner").join("repo").join("main");
         fs::create_dir_all(wt_a.parent().unwrap()).unwrap();
-        git_ok(&bare_a, &["worktree", "add", &wt_a.to_string_lossy(), "main"]);
+        git_ok(
+            &bare_a,
+            &["worktree", "add", &wt_a.to_string_lossy(), "main"],
+        );
         let wt_b = worktree_root.join("stray").join("repo-b");
         fs::create_dir_all(wt_b.parent().unwrap()).unwrap();
-        git_ok(&bare_b, &["worktree", "add", &wt_b.to_string_lossy(), "main"]);
+        git_ok(
+            &bare_b,
+            &["worktree", "add", &wt_b.to_string_lossy(), "main"],
+        );
         // Diverge B with a commit A does not have (unique unpushed work).
         fs::write(wt_b.join("b-only.txt"), "unique to B").unwrap();
         git_ok(&wt_b, &["add", "-A"]);
@@ -5803,9 +5931,10 @@ mod tests {
         let actions: Vec<MigrateAction> = plan.groups.iter().flat_map(group_actions).collect();
         // No destructive consolidation actions are derived for a divergent cluster.
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, MigrateAction::RetireBare { .. } | MigrateAction::DropWorktree { .. })),
+            !actions.iter().any(|a| matches!(
+                a,
+                MigrateAction::RetireBare { .. } | MigrateAction::DropWorktree { .. }
+            )),
             "divergent cluster must not retire or drop: {actions:?}"
         );
 
@@ -5836,7 +5965,10 @@ mod tests {
     fn reconstruct_leaf_uses_main_pattern_or_branch() {
         // main/master/detached/undetermined render through the main pattern.
         assert_eq!(reconstruct_leaf(Some("main"), "o", "r", "{branch}"), "main");
-        assert_eq!(reconstruct_leaf(Some("master"), "o", "r", "{branch}"), "master");
+        assert_eq!(
+            reconstruct_leaf(Some("master"), "o", "r", "{branch}"),
+            "master"
+        );
         assert_eq!(reconstruct_leaf(None, "o", "r", "{branch}"), "main");
         assert_eq!(reconstruct_leaf(Some("HEAD"), "o", "r", "{branch}"), "main");
         // Any other branch keeps its name, with `/` flattened to a single leaf.
@@ -5931,10 +6063,7 @@ mod tests {
 
         let actions = reconstruct_actions(&plan);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(
-            &actions[0],
-            MigrateAction::ReconstructBare { .. }
-        ));
+        assert!(matches!(&actions[0], MigrateAction::ReconstructBare { .. }));
     }
 
     #[test]
@@ -6025,7 +6154,9 @@ mod tests {
 
         // Every branch is preserved at its exact commit (incl. the unpushed one).
         assert_eq!(
-            run_git_capture(&bare, &["rev-parse", "main"]).unwrap().trim(),
+            run_git_capture(&bare, &["rev-parse", "main"])
+                .unwrap()
+                .trim(),
             main_sha,
             "main's unpushed commit must be preserved"
         );
@@ -6042,23 +6173,36 @@ mod tests {
         assert!(stash.contains("wip"), "stash must survive: {stash:?}");
 
         // Working-tree contents are byte-for-byte intact.
-        assert_eq!(fs::read_to_string(wt.join("README.md")).unwrap(), "unstaged edit");
-        assert_eq!(fs::read_to_string(wt.join("untracked.txt")).unwrap(), "untracked");
+        assert_eq!(
+            fs::read_to_string(wt.join("README.md")).unwrap(),
+            "unstaged edit"
+        );
+        assert_eq!(
+            fs::read_to_string(wt.join("untracked.txt")).unwrap(),
+            "untracked"
+        );
         assert_eq!(
             fs::read_to_string(wt.join("secret.env")).unwrap(),
             "TOKEN=xyz",
             "gitignored file preserved"
         );
-        assert_eq!(fs::read_to_string(wt.join("local.txt")).unwrap(), "local only");
+        assert_eq!(
+            fs::read_to_string(wt.join("local.txt")).unwrap(),
+            "local only"
+        );
 
         // Staged vs. unstaged split is preserved exactly (index restored).
         let status = run_git_capture(&wt, &["status", "--porcelain"]).unwrap();
         assert!(
-            status.lines().any(|l| l.starts_with("A ") && l.contains(".gitignore")),
+            status
+                .lines()
+                .any(|l| l.starts_with("A ") && l.contains(".gitignore")),
             ".gitignore must stay STAGED: {status:?}"
         );
         assert!(
-            status.lines().any(|l| l.starts_with(" M") && l.contains("README.md")),
+            status
+                .lines()
+                .any(|l| l.starts_with(" M") && l.contains("README.md")),
             "README.md must stay UNSTAGED-modified: {status:?}"
         );
     }
@@ -6084,7 +6228,10 @@ mod tests {
 
         let status = reconstruct_bare(&clone, &bare, &wt, Some("main"));
         assert!(
-            matches!(status, ApplyStatus::Moved | ApplyStatus::MovedWithWarnings(_)),
+            matches!(
+                status,
+                ApplyStatus::Moved | ApplyStatus::MovedWithWarnings(_)
+            ),
             "salvage-and-rebuild must succeed: {status:?}"
         );
         assert!(
@@ -6094,7 +6241,10 @@ mod tests {
             "a real bare must now sit at the destination"
         );
         assert!(wt.join(".git").is_file(), "the worktree must be attached");
-        assert!(!clone.exists(), "the intact clone is consumed by the rebuild");
+        assert!(
+            !clone.exists(),
+            "the intact clone is consumed by the rebuild"
+        );
         // The partial bare was retired to recoverable trash, never deleted outright.
         let trash = bare_root.join(".stokd-migrate-trash").join("acme");
         assert!(
@@ -6120,11 +6270,20 @@ mod tests {
         fs::create_dir_all(bare.parent().unwrap()).unwrap();
         git_ok(
             tmp.path(),
-            &["clone", "--bare", &clone.to_string_lossy(), &bare.to_string_lossy()],
+            &[
+                "clone",
+                "--bare",
+                &clone.to_string_lossy(),
+                &bare.to_string_lossy(),
+            ],
         );
         git_ok(
             &bare,
-            &["config", "remote.origin.url", "git@github.com:acme/widgets.git"],
+            &[
+                "config",
+                "remote.origin.url",
+                "git@github.com:acme/widgets.git",
+            ],
         );
 
         let wt = worktree_root.join("acme").join("widgets").join("main");
@@ -6139,7 +6298,10 @@ mod tests {
             matches!(status, ApplyStatus::MovedWithWarnings(_)),
             "resume warns that the original clone remains: {status:?}"
         );
-        assert!(wt.join(".git").is_file(), "the missing worktree is now attached");
+        assert!(
+            wt.join(".git").is_file(),
+            "the missing worktree is now attached"
+        );
         assert!(
             clone.exists(),
             "resume never touches the intact clone (left for the human to remove)"
@@ -6282,7 +6444,10 @@ mod tests {
             .args(["status", "--porcelain"])
             .output()
             .unwrap();
-        assert!(status.status.success(), "git status must work in the worktree");
+        assert!(
+            status.status.success(),
+            "git status must work in the worktree"
+        );
         let s = String::from_utf8_lossy(&status.stdout);
         assert!(
             s.contains("README.md"),

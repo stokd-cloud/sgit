@@ -2,9 +2,7 @@
 
 use std::path::PathBuf;
 
-use sgit_core::{
-    discover_bare_repos, ensure_pin_and_hook, load_repositories_config, run_clean_at,
-};
+use sgit_core::{discover_bare_repos, ensure_pin_and_hook, load_repositories_config, run_clean_at};
 
 /// `sgit worktree clean [--dry-run]` — remove landed/merged linked worktrees.
 pub fn run_clean(dry_run: bool) {
@@ -32,7 +30,10 @@ pub fn run_pin(all: bool, off: bool, json: bool) {
             .0;
         let found = discover_bare_repos(std::path::Path::new(&cfg.bare_root));
         if found.is_empty() {
-            eprintln!("sgit worktree pin: no bare repos found under {}", cfg.bare_root);
+            eprintln!(
+                "sgit worktree pin: no bare repos found under {}",
+                cfg.bare_root
+            );
             std::process::exit(1);
         }
         found
@@ -48,10 +49,7 @@ pub fn run_pin(all: bool, off: bool, json: bool) {
         match ensure_pin_and_hook(anchor, off) {
             Ok(r) => results.push((anchor.clone(), r)),
             Err(e) => {
-                eprintln!(
-                    "sgit worktree pin: failed for {}: {e}",
-                    anchor.display()
-                );
+                eprintln!("sgit worktree pin: failed for {}: {e}", anchor.display());
                 std::process::exit(1);
             }
         }

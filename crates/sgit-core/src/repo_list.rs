@@ -145,10 +145,19 @@ mod tests {
         let entries = list_bare_repos(&cfg);
         assert_eq!(entries.len(), 2, "both dirs are listed: {entries:?}");
 
-        let junk_entry = entries.iter().find(|e| e.repo == "junk").expect("junk listed");
-        assert!(!junk_entry.valid, "plain dir with .git suffix is flagged invalid");
+        let junk_entry = entries
+            .iter()
+            .find(|e| e.repo == "junk")
+            .expect("junk listed");
+        assert!(
+            !junk_entry.valid,
+            "plain dir with .git suffix is flagged invalid"
+        );
 
-        let real_entry = entries.iter().find(|e| e.repo == "real").expect("real listed");
+        let real_entry = entries
+            .iter()
+            .find(|e| e.repo == "real")
+            .expect("real listed");
         assert!(real_entry.valid, "actual bare repo is valid");
     }
 }

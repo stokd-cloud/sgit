@@ -137,11 +137,9 @@ pub fn shove(
             match simple_commit(repo_root, &commit_msg)? {
                 CommitOutcome::Committed | CommitOutcome::NothingToCommit => {}
                 CommitOutcome::PreCommitFailure => {
-                    return Err(
-                        "git commit failed: pre-commit hook rejected the commit \
+                    return Err("git commit failed: pre-commit hook rejected the commit \
                          (sgit has no agent remediation — fix hooks manually and retry)"
-                            .to_string(),
-                    );
+                        .to_string());
                 }
                 CommitOutcome::HardError => {
                     return Err("git commit failed".to_string());
@@ -244,31 +242,39 @@ fn backup_stamp() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
-/// Parse unmerged paths, dispatch the resolver when real conflict markers are
-/// present, verify markers are gone, then `git add -A` + `git rebase --continue`.
+/// Read the index STAGES for an in-progress rebase, dispatch the resolver for
+/// every conflict that needs a decision, verify the resolution, stage exactly
+/// the conflicted paths, then `git rebase --continue`.
+///
+/// Stage-derived rather than marker-derived: a modify/delete conflict leaves no
+/// file (and therefore no markers) on the deleting side, so a text scan sees
+/// nothing and a blanket `git add -A` would stage the surviving copy and
+/// RESURRECT the deleted file.
 pub fn resolve_rebase_conflicts(
     repo_root: &Path,
     branch: &str,
     resolver: &dyn ConflictResolver,
 ) -> Result<(), String> {
-    let name_only = run_git_captured(repo_root, &["diff", "--name-only", "--diff-filter=U"]);
-    let files = parse_unmerged_paths(&name_only.stdout);
-    if files.is_empty() {
+    let entries = read_unmerged_entries(repo_root);
+    if entries.is_empty() {
         return Ok(());
     }
-    let has_markers = files.iter().any(|file| {
-        let content = std::fs::read_to_string(repo_root.join(file)).unwrap_or_default();
-        contains_conflict_markers(&content)
-    });
-    if !has_markers {
-        // No content markers — stage what the rebase produced and continue.
-        run_git(repo_root, &["add", "-A"])?;
+    let files = unmerged_entry_paths(&entries);
+    let any_markers = any_conflict_markers_on_disk(repo_root, &files);
+
+    if !conflict_round_needs_resolver(&entries, any_markers) {
+        // Nothing to decide (e.g. a marker-less both-modified path the rebase
+        // already materialized) — stage exactly those paths and continue.
+        stage_conflict_resolution(repo_root, &entries)?;
+        verify_conflict_staged(repo_root, &entries)?;
         run_git_rebase_continue(repo_root)?;
         return Ok(());
     }
+
     println!(
-        "Rebase hit conflicts in {} file(s); invoking ConflictResolver...",
-        files.len()
+        "Rebase hit conflicts in {} file(s) ({}); invoking ConflictResolver...",
+        files.len(),
+        summarize_unmerged_kinds(&entries)
     );
     resolver.resolve(&ConflictContext {
         repo_root: repo_root.to_path_buf(),
@@ -277,16 +283,272 @@ pub fn resolve_rebase_conflicts(
         kind: ConflictKind::Rebase,
     })?;
 
-    for file in &files {
-        let content = std::fs::read_to_string(repo_root.join(file)).unwrap_or_default();
+    verify_conflict_markers_cleared(repo_root, &entries)?;
+    stage_conflict_resolution(repo_root, &entries)?;
+    verify_conflict_staged(repo_root, &entries)?;
+    run_git_rebase_continue(repo_root)?;
+    Ok(())
+}
+
+// ── Unmerged index stages (modify/delete-safe conflict handling) ─────────────
+
+/// How git's index stages classify one unmerged path. Derived from which of
+/// stage 1 (merge base), 2 (ours) and 3 (theirs) are present — the only source
+/// that can see a conflict with no file, and therefore no markers, on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnmergedKind {
+    /// Stages 1+2+3 — the ordinary textual both-modified conflict.
+    BothModified,
+    /// Stages 1+2 — present at the base and on our side, deleted on theirs.
+    DeletedByThem,
+    /// Stages 1+3 — present at the base and on their side, deleted on ours.
+    DeletedByUs,
+    /// Stages 2+3 with no base — both sides added the path (or a rename landed
+    /// on it from both directions).
+    BothAdded,
+    /// Stage 2 only — added by us (the far side of a rename).
+    AddedByUs,
+    /// Stage 3 only — added by them (the far side of a rename).
+    AddedByThem,
+    /// Stage 1 only, or any combination git does not otherwise name.
+    Other,
+}
+
+impl UnmergedKind {
+    /// Short label used in operator-facing conflict summaries.
+    pub fn label(self) -> &'static str {
+        match self {
+            UnmergedKind::BothModified => "both-modified",
+            UnmergedKind::DeletedByThem => "modify/delete",
+            UnmergedKind::DeletedByUs => "delete/modify",
+            UnmergedKind::BothAdded => "add/add",
+            UnmergedKind::AddedByUs => "added-by-us",
+            UnmergedKind::AddedByThem => "added-by-them",
+            UnmergedKind::Other => "other",
+        }
+    }
+
+    /// True when the conflict is STRUCTURAL — a decision about whether the path
+    /// exists at all, not about how two texts merge. Structural conflicts carry
+    /// no markers, so they must be routed to the resolver explicitly; leaving
+    /// them to `git add` silently resurrects deliberately deleted files.
+    pub fn is_structural(self) -> bool {
+        !matches!(self, UnmergedKind::BothModified)
+    }
+}
+
+/// One unmerged index entry: the path plus its stage-derived classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmergedEntry {
+    pub path: String,
+    pub kind: UnmergedKind,
+}
+
+/// Parse `git ls-files -u` output into one classified entry per path, in
+/// first-seen order. Each line is `<mode> <sha> <stage>\t<path>`; a path appears
+/// once per present stage, so the stages are folded together per path.
+pub fn parse_unmerged_entries(ls_files_u: &str) -> Vec<UnmergedEntry> {
+    // Preserve encounter order while folding the stages of each path together.
+    let mut order: Vec<String> = Vec::new();
+    let mut stages: std::collections::HashMap<String, [bool; 3]> =
+        std::collections::HashMap::new();
+    for line in ls_files_u.lines() {
+        let Some((meta, path)) = line.split_once('\t') else {
+            continue;
+        };
+        let path = path.trim_end_matches('\r');
+        if path.is_empty() {
+            continue;
+        }
+        let Some(stage) = meta
+            .split_whitespace()
+            .next_back()
+            .and_then(|s| s.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if !(1..=3).contains(&stage) {
+            continue;
+        }
+        let seen = stages.entry(path.to_string()).or_insert_with(|| {
+            order.push(path.to_string());
+            [false; 3]
+        });
+        seen[stage - 1] = true;
+    }
+    order
+        .into_iter()
+        .map(|path| {
+            let seen = stages.get(&path).copied().unwrap_or([false; 3]);
+            let kind = match seen {
+                [true, true, true] => UnmergedKind::BothModified,
+                [true, true, false] => UnmergedKind::DeletedByThem,
+                [true, false, true] => UnmergedKind::DeletedByUs,
+                [false, true, true] => UnmergedKind::BothAdded,
+                [false, true, false] => UnmergedKind::AddedByUs,
+                [false, false, true] => UnmergedKind::AddedByThem,
+                _ => UnmergedKind::Other,
+            };
+            UnmergedEntry { path, kind }
+        })
+        .collect()
+}
+
+/// Read the live unmerged index stages of an in-progress merge/rebase.
+/// `core.quotePath=false` keeps non-ASCII paths unescaped so they still match
+/// what the filesystem holds.
+pub fn read_unmerged_entries(repo_root: &Path) -> Vec<UnmergedEntry> {
+    let out = run_git_captured(
+        repo_root,
+        &["-c", "core.quotePath=false", "ls-files", "-u"],
+    );
+    parse_unmerged_entries(&out.stdout)
+}
+
+/// The paths of a classified unmerged set, in order.
+pub fn unmerged_entry_paths(entries: &[UnmergedEntry]) -> Vec<String> {
+    entries.iter().map(|e| e.path.clone()).collect()
+}
+
+/// Pure: whether this conflict round needs a [`ConflictResolver`] decision.
+///
+/// Marker-bearing text conflicts always did. A STRUCTURAL conflict —
+/// modify/delete, add/add, either half of a rename — needs one too even though
+/// it carries no markers: "does this path survive?" is a decision no automatic
+/// staging can make, and answering it by default resurrects deleted files.
+pub fn conflict_round_needs_resolver(entries: &[UnmergedEntry], any_markers: bool) -> bool {
+    any_markers || entries.iter().any(|e| e.kind.is_structural())
+}
+
+/// Pure: one-line operator summary of the conflict classes in this round, e.g.
+/// `2 both-modified, 1 modify/delete`.
+pub fn summarize_unmerged_kinds(entries: &[UnmergedEntry]) -> String {
+    let mut counts: Vec<(&'static str, usize)> = Vec::new();
+    for entry in entries {
+        let label = entry.kind.label();
+        match counts.iter_mut().find(|(l, _)| *l == label) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((label, 1)),
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(label, n)| format!("{n} {label}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// How a resolved conflicted path is recorded in the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageAction {
+    /// The path survives with content — `git add -- <path>`.
+    Add,
+    /// The resolution is "stays deleted" — `git rm -- <path>`.
+    Remove,
+}
+
+/// Pure: the index action for one resolved path, from whether the resolver left
+/// it on disk. This is the whole of the fix for modify/delete: the absent side
+/// is recorded as a DELETE instead of being re-added by a blanket `git add -A`.
+pub fn stage_action_for(path_exists_on_disk: bool) -> StageAction {
+    if path_exists_on_disk {
+        StageAction::Add
+    } else {
+        StageAction::Remove
+    }
+}
+
+/// True when the path exists in the working tree (a dangling symlink counts as
+/// present — it is a real entry the resolver chose to keep).
+fn path_present(repo_root: &Path, path: &str) -> bool {
+    repo_root.join(path).symlink_metadata().is_ok()
+}
+
+/// True when ANY of `files` still carries conflict markers on disk. A missing
+/// file is not "marker-free by accident" — it simply has no text to scan, which
+/// is why marker presence can never be the sole conflict gate.
+pub fn any_conflict_markers_on_disk(repo_root: &Path, files: &[String]) -> bool {
+    files.iter().any(|file| {
+        std::fs::read_to_string(repo_root.join(file))
+            .map(|content| contains_conflict_markers(&content))
+            .unwrap_or(false)
+    })
+}
+
+/// Verify the resolver cleared every conflict marker it could. Runs BEFORE
+/// staging so markers are never committed to the index.
+pub fn verify_conflict_markers_cleared(
+    repo_root: &Path,
+    entries: &[UnmergedEntry],
+) -> Result<(), String> {
+    for entry in entries {
+        if !path_present(repo_root, &entry.path) {
+            continue; // resolved as deleted — no text to check
+        }
+        let Ok(content) = std::fs::read_to_string(repo_root.join(&entry.path)) else {
+            continue; // binary / unreadable — markers are not the contract here
+        };
         if contains_conflict_markers(&content) {
             return Err(format!(
-                "conflict markers still present in {file} after resolution; the rebase is left in place so both sides are preserved"
+                "conflict markers still present in {} after resolution; the operation is left \
+                 in place so both sides are preserved",
+                entry.path
             ));
         }
     }
-    run_git(repo_root, &["add", "-A"])?;
-    run_git_rebase_continue(repo_root)?;
+    Ok(())
+}
+
+/// Stage the resolution for EXACTLY the paths that were unmerged in this round.
+/// Never `git add -A`: that stages unrelated working-tree state and, on a
+/// modify/delete, re-adds the file the resolution deleted.
+pub fn stage_conflict_resolution(
+    repo_root: &Path,
+    entries: &[UnmergedEntry],
+) -> Result<(), String> {
+    for entry in entries {
+        match stage_action_for(path_present(repo_root, &entry.path)) {
+            StageAction::Add => run_git(repo_root, &["add", "--", &entry.path])?,
+            StageAction::Remove => {
+                // `git rm -f` clears every stage for the path; the working-tree
+                // copy is already gone, which is precisely the resolution.
+                let removed = run_git_captured(repo_root, &["rm", "-f", "--", &entry.path]);
+                if !removed.success {
+                    run_git(repo_root, &["rm", "--cached", "-f", "--", &entry.path])?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verify the staged result actually matches the resolution: no path is still
+/// unmerged, and a path resolved as deleted is genuinely gone from the index
+/// (not silently resurrected).
+pub fn verify_conflict_staged(
+    repo_root: &Path,
+    entries: &[UnmergedEntry],
+) -> Result<(), String> {
+    for entry in entries {
+        let unmerged = run_git_captured(repo_root, &["ls-files", "-u", "--", &entry.path]);
+        if unmerged.success && !unmerged.stdout.trim().is_empty() {
+            return Err(format!(
+                "{} is still unmerged after staging the resolution",
+                entry.path
+            ));
+        }
+        if path_present(repo_root, &entry.path) {
+            continue;
+        }
+        let indexed = run_git_captured(repo_root, &["ls-files", "--", &entry.path]);
+        if indexed.success && !indexed.stdout.trim().is_empty() {
+            return Err(format!(
+                "{} was resolved as deleted but is still present in the index \
+                 (staging it would resurrect it)",
+                entry.path
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -811,6 +1073,125 @@ mod tests {
         assert!(local.contains("local"));
         assert!(remote.contains("remote"));
         assert!(local.contains("feat-x"));
+    }
+
+    /// `git ls-files -u` stages are the ONLY signal that sees a modify/delete
+    /// conflict — the delete side has no file, and therefore no markers.
+    #[test]
+    fn parse_unmerged_entries_classifies_index_stages() {
+        let raw = "\
+100644 aaa 1\tboth.txt
+100644 bbb 2\tboth.txt
+100644 ccc 3\tboth.txt
+100644 ddd 1\tdoomed.txt
+100644 eee 2\tdoomed.txt
+100644 fff 1\tgone.txt
+100644 ggg 3\tgone.txt
+100644 hhh 2\tnew.txt
+100644 iii 3\tnew.txt
+100644 jjj 2\trenamed.txt
+100644 kkk 1\tvanished.txt
+";
+        let entries = parse_unmerged_entries(raw);
+        assert_eq!(
+            entries,
+            vec![
+                UnmergedEntry {
+                    path: "both.txt".into(),
+                    kind: UnmergedKind::BothModified
+                },
+                UnmergedEntry {
+                    path: "doomed.txt".into(),
+                    kind: UnmergedKind::DeletedByThem
+                },
+                UnmergedEntry {
+                    path: "gone.txt".into(),
+                    kind: UnmergedKind::DeletedByUs
+                },
+                UnmergedEntry {
+                    path: "new.txt".into(),
+                    kind: UnmergedKind::BothAdded
+                },
+                UnmergedEntry {
+                    path: "renamed.txt".into(),
+                    kind: UnmergedKind::AddedByUs
+                },
+                UnmergedEntry {
+                    path: "vanished.txt".into(),
+                    kind: UnmergedKind::Other
+                },
+            ]
+        );
+        assert_eq!(
+            unmerged_entry_paths(&entries).first().map(String::as_str),
+            Some("both.txt")
+        );
+        // Paths with spaces survive: everything after the TAB is the path.
+        let spaced = parse_unmerged_entries("100644 aaa 2\tdir/a file.txt\n");
+        assert_eq!(spaced.len(), 1);
+        assert_eq!(spaced[0].path, "dir/a file.txt");
+        assert!(parse_unmerged_entries("").is_empty());
+    }
+
+    /// A marker-less structural conflict must STILL reach the resolver — that
+    /// gap is what let `git add -A` resurrect a deleted file.
+    #[test]
+    fn conflict_round_needs_resolver_routes_structural_conflicts() {
+        let both = vec![UnmergedEntry {
+            path: "a".into(),
+            kind: UnmergedKind::BothModified,
+        }];
+        let modify_delete = vec![UnmergedEntry {
+            path: "a".into(),
+            kind: UnmergedKind::DeletedByThem,
+        }];
+        let rename = vec![UnmergedEntry {
+            path: "a".into(),
+            kind: UnmergedKind::AddedByThem,
+        }];
+
+        // Both-modified with markers → resolver (unchanged behavior).
+        assert!(conflict_round_needs_resolver(&both, true));
+        // Both-modified with no markers (binary / already materialized) → no
+        // resolver, also unchanged.
+        assert!(!conflict_round_needs_resolver(&both, false));
+        // Structural conflicts need a decision even with no markers anywhere.
+        assert!(conflict_round_needs_resolver(&modify_delete, false));
+        assert!(conflict_round_needs_resolver(&rename, false));
+        assert!(!conflict_round_needs_resolver(&[], false));
+
+        assert!(UnmergedKind::DeletedByThem.is_structural());
+        assert!(UnmergedKind::DeletedByUs.is_structural());
+        assert!(!UnmergedKind::BothModified.is_structural());
+    }
+
+    #[test]
+    fn stage_action_records_absence_as_a_delete() {
+        assert_eq!(stage_action_for(true), StageAction::Add);
+        assert_eq!(stage_action_for(false), StageAction::Remove);
+    }
+
+    #[test]
+    fn summarize_unmerged_kinds_counts_each_class() {
+        let entries = vec![
+            UnmergedEntry {
+                path: "a".into(),
+                kind: UnmergedKind::BothModified,
+            },
+            UnmergedEntry {
+                path: "b".into(),
+                kind: UnmergedKind::BothModified,
+            },
+            UnmergedEntry {
+                path: "c".into(),
+                kind: UnmergedKind::DeletedByThem,
+            },
+        ];
+        assert_eq!(
+            summarize_unmerged_kinds(&entries),
+            "2 both-modified, 1 modify/delete"
+        );
+        assert_eq!(summarize_unmerged_kinds(&[]), "");
     }
 
     #[test]

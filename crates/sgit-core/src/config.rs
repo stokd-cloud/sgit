@@ -181,8 +181,7 @@ fn parse_repositories_yaml(text: &str) -> Result<RepositoriesConfig, String> {
         }
     }
     // Bare repositories object (standalone SGIT_CONFIG / XDG fixtures).
-    serde_yaml::from_str::<RepositoriesConfig>(text)
-        .map_err(|e| format!("YAML parse error: {e}"))
+    serde_yaml::from_str::<RepositoriesConfig>(text).map_err(|e| format!("YAML parse error: {e}"))
 }
 
 /// Merge target `git.*` over legacy `repositories.*` (git wins when set).

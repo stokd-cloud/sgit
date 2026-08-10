@@ -85,7 +85,12 @@ pub fn resolve_default_branch_at(path: &Path) -> String {
     let head = Command::new("git")
         .arg("-C")
         .arg(path)
-        .args(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+        .args([
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
         .output();
     if let Ok(output) = head {
         if output.status.success() {
@@ -136,16 +141,14 @@ pub fn worktree_is_clean(worktree_path: &Path) -> Result<bool, String> {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
 
-    let has_real_changes = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|line| {
-            if line.len() > 3 {
-                let filename = &line[3..];
-                !should_ignore_changed_file(filename)
-            } else {
-                false
-            }
-        });
+    let has_real_changes = String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        if line.len() > 3 {
+            let filename = &line[3..];
+            !should_ignore_changed_file(filename)
+        } else {
+            false
+        }
+    });
 
     Ok(!has_real_changes)
 }

@@ -40,10 +40,7 @@ impl WorktreeRepairTarget {
     }
 
     pub fn broken(path: PathBuf) -> Self {
-        Self {
-            path,
-            broken: true,
-        }
+        Self { path, broken: true }
     }
 }
 

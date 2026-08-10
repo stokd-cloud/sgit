@@ -44,9 +44,8 @@ pub struct CleanSummary {
 ///
 /// When `dry_run` is true, candidates are reported but not removed.
 pub fn run_clean_at(cwd: &Path, dry_run: bool) -> Result<CleanSummary, String> {
-    let repo_root = detect_repo_root_at(cwd).ok_or_else(|| {
-        "not inside a git repository".to_string()
-    })?;
+    let repo_root =
+        detect_repo_root_at(cwd).ok_or_else(|| "not inside a git repository".to_string())?;
 
     let base_ref = resolve_primary_base_ref(&repo_root).ok_or_else(|| {
         "failed to resolve a main branch reference for this repository".to_string()
@@ -161,10 +160,19 @@ pub fn run_clean_at(cwd: &Path, dry_run: bool) -> Result<CleanSummary, String> {
     println!("Worktree clean summary:");
     println!("  Removed                    : {}", summary.removed);
     println!("  Skipped dirty              : {}", summary.skipped_dirty);
-    println!("  Skipped unmerged           : {}", summary.skipped_unmerged);
+    println!(
+        "  Skipped unmerged           : {}",
+        summary.skipped_unmerged
+    );
     println!("  Skipped broken             : {}", summary.skipped_broken);
-    println!("  Skipped protected          : {}", summary.skipped_protected);
-    println!("  Skipped detached           : {}", summary.skipped_detached);
+    println!(
+        "  Skipped protected          : {}",
+        summary.skipped_protected
+    );
+    println!(
+        "  Skipped detached           : {}",
+        summary.skipped_detached
+    );
     println!("  Errors                     : {}", summary.errors);
 
     if summary.errors > 0 {
@@ -310,9 +318,7 @@ fn short_branch_name(branch: &str) -> String {
 }
 
 fn is_protected_branch(branch: &str, base_branch: &str) -> bool {
-    matches!(branch, "main" | "master")
-        || branch == base_branch
-        || branch == BARE_HUB_PLACEHOLDER
+    matches!(branch, "main" | "master") || branch == base_branch || branch == BARE_HUB_PLACEHOLDER
 }
 
 fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeEntry>, String> {
@@ -408,7 +414,10 @@ mod tests {
             ],
         );
         git(&merged_wt, &["commit", "-q", "--allow-empty", "-m", "feat"]);
-        git(&main_wt, &["merge", "-q", "--no-ff", "feature-merged", "-m", "m"]);
+        git(
+            &main_wt,
+            &["merge", "-q", "--no-ff", "feature-merged", "-m", "m"],
+        );
 
         // Unmerged branch: commit not merged.
         git(
@@ -422,19 +431,19 @@ mod tests {
                 unmerged_wt.to_str().unwrap(),
             ],
         );
-        git(&unmerged_wt, &["commit", "-q", "--allow-empty", "-m", "open"]);
+        git(
+            &unmerged_wt,
+            &["commit", "-q", "--allow-empty", "-m", "open"],
+        );
 
         let _ = bare; // layout is primary-linked, not bare — fine for clean
         let summary = run_clean_at(&main_wt, false).expect("clean ok");
-        assert_eq!(summary.removed, 1, "one merged worktree removed: {summary:?}");
-        assert!(
-            !merged_wt.exists(),
-            "merged worktree path should be gone"
+        assert_eq!(
+            summary.removed, 1,
+            "one merged worktree removed: {summary:?}"
         );
-        assert!(
-            unmerged_wt.exists(),
-            "unmerged worktree must be preserved"
-        );
+        assert!(!merged_wt.exists(), "merged worktree path should be gone");
+        assert!(unmerged_wt.exists(), "unmerged worktree must be preserved");
         assert!(
             summary.skipped_unmerged >= 1,
             "unmerged counted: {summary:?}"

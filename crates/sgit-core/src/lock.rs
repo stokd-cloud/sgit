@@ -99,8 +99,7 @@ impl LockSet {
         if name.is_empty() || !name.starts_with("refs/") {
             return false;
         }
-        self.entries.contains(name)
-            || (self.entries.contains(LOCK_WILDCARD))
+        self.entries.contains(name) || (self.entries.contains(LOCK_WILDCARD))
     }
 }
 
@@ -125,9 +124,8 @@ pub fn write_repo_locks(common_git_dir: &Path, locks: &LockSet) -> Result<(), St
             body.push_str(entry);
             body.push('\n');
         }
-        std::fs::write(&path, body).map_err(|error| {
-            format!("failed to write {}: {error}", path.display())
-        })
+        std::fs::write(&path, body)
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))
     }
 }
 
@@ -216,7 +214,10 @@ pub fn remove_lock(
     entry: &str,
     approve: &dyn Fn(&str) -> Result<(), String>,
 ) -> Result<LockSet, String> {
-    approve(&format!("unlock '{entry}' for {}", common_git_dir.display()))?;
+    approve(&format!(
+        "unlock '{entry}' for {}",
+        common_git_dir.display()
+    ))?;
 
     let mut repo_locks = read_repo_locks(common_git_dir);
     repo_locks.remove(entry);
@@ -286,7 +287,11 @@ impl LockHook {
 ///   the branch ref is where accidental local damage lands.
 /// * `pre-push` gates every real ref: a push is always a deliberate act, so a
 ///   repo-wide lock covers branches AND tags there.
-pub fn gated_refs_for_hook<'r>(hook: LockHook, refs: &'r [String], locks: &LockSet) -> Vec<&'r str> {
+pub fn gated_refs_for_hook<'r>(
+    hook: LockHook,
+    refs: &'r [String],
+    locks: &LockSet,
+) -> Vec<&'r str> {
     gated_refs(refs, locks)
         .into_iter()
         .filter(|ref_name| match hook {
@@ -399,8 +404,12 @@ pub fn install_pre_push_hook(anchor: &Path) -> Result<PathBuf, String> {
     let common = crate::worktree_pin::resolve_common_git_dir(anchor)
         .ok_or_else(|| format!("not a git repository: {}", anchor.display()))?;
     let hooks_dir = crate::worktree_pin::resolve_hooks_dir_for_pin(&common)?;
-    std::fs::create_dir_all(&hooks_dir)
-        .map_err(|error| format!("failed to create hooks dir {}: {error}", hooks_dir.display()))?;
+    std::fs::create_dir_all(&hooks_dir).map_err(|error| {
+        format!(
+            "failed to create hooks dir {}: {error}",
+            hooks_dir.display()
+        )
+    })?;
 
     let script_path = hooks_dir.join("pre-push");
     let content = standalone_pre_push_script(crate::worktree_pin::PIN_HOOKS_VERSION);
@@ -520,7 +529,10 @@ mod tests {
         );
 
         let push = "refs/heads/feature aaaa refs/heads/main bbbb\n";
-        assert_eq!(refs_from_pre_push(push), vec!["refs/heads/main".to_string()]);
+        assert_eq!(
+            refs_from_pre_push(push),
+            vec!["refs/heads/main".to_string()]
+        );
     }
 
     #[test]
@@ -540,7 +552,11 @@ mod tests {
         // A push is deliberate: everything is gated.
         assert_eq!(
             gated_refs_for_hook(LockHook::PrePush, &refs, &repo_wide),
-            vec!["refs/heads/main", "refs/tags/v1", "refs/remotes/origin/main"]
+            vec![
+                "refs/heads/main",
+                "refs/tags/v1",
+                "refs/remotes/origin/main"
+            ]
         );
         assert_eq!(LockHook::parse("pre-push"), Some(LockHook::PrePush));
         assert_eq!(
@@ -557,19 +573,28 @@ mod tests {
             pre_push_lock_fragment(),
         ] {
             assert!(fragment.contains("sgit lock enforce"));
-            assert!(fragment.contains("command -v sgit"), "must probe for the binary");
+            assert!(
+                fragment.contains("command -v sgit"),
+                "must probe for the binary"
+            );
             assert!(
                 fragment.contains("not on PATH") && fragment.contains("exit 1"),
                 "missing binary with a repo lock file must fail closed"
             );
             // No off-switch may be advertised (mirrors the pin refusal contract).
             for leak in ["--off", "unlock with", "to bypass"] {
-                assert!(!fragment.contains(leak), "fragment leaks an off-switch: {leak}");
+                assert!(
+                    !fragment.contains(leak),
+                    "fragment leaks an off-switch: {leak}"
+                );
             }
         }
         let standalone = standalone_pre_push_script(1);
         assert!(standalone.contains(MANAGED_HOOK_MARKER));
-        assert!(standalone.contains("pre-push.sgit-prior"), "must chain to a preserved prior hook");
+        assert!(
+            standalone.contains("pre-push.sgit-prior"),
+            "must chain to a preserved prior hook"
+        );
     }
 
     fn scratch_repo() -> (tempfile::TempDir, PathBuf) {
@@ -634,9 +659,13 @@ mod tests {
             }
             cmd.output().expect("git runs")
         };
-        assert!(run(&["config", "user.email", "t@t.co"], &[]).status.success());
+        assert!(run(&["config", "user.email", "t@t.co"], &[])
+            .status
+            .success());
         assert!(run(&["config", "user.name", "t"], &[]).status.success());
-        assert!(run(&["commit", "-q", "--allow-empty", "-m", "init"], &[]).status.success());
+        assert!(run(&["commit", "-q", "--allow-empty", "-m", "init"], &[])
+            .status
+            .success());
 
         // Install the managed hooks and lock the branch (repo file only — the
         // scratch HOME below has no registry).
@@ -650,8 +679,11 @@ mod tests {
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let shim = bin.join("sgit");
-        std::fs::write(&shim, "#!/bin/sh\ncat >/dev/null\nexit \"${SGIT_FAKE_VERDICT:-1}\"\n")
-            .unwrap();
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\ncat >/dev/null\nexit \"${SGIT_FAKE_VERDICT:-1}\"\n",
+        )
+        .unwrap();
         let mut perms = std::fs::metadata(&shim).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&shim, perms).unwrap();
@@ -668,14 +700,32 @@ mod tests {
         // Denied biometric → commit refused.
         let denied = run(
             &["commit", "-q", "--allow-empty", "-m", "locked"],
-            &[("PATH", &path_env), ("HOME", &home_env), ("SGIT_FAKE_VERDICT", "1")],
+            &[
+                ("PATH", &path_env),
+                ("HOME", &home_env),
+                ("SGIT_FAKE_VERDICT", "1"),
+            ],
         );
-        assert!(!denied.status.success(), "denied enforce must block the commit");
+        assert!(
+            !denied.status.success(),
+            "denied enforce must block the commit"
+        );
 
         // `--no-verify` must NOT bypass the gate.
         let no_verify = run(
-            &["commit", "-q", "--no-verify", "--allow-empty", "-m", "locked"],
-            &[("PATH", &path_env), ("HOME", &home_env), ("SGIT_FAKE_VERDICT", "1")],
+            &[
+                "commit",
+                "-q",
+                "--no-verify",
+                "--allow-empty",
+                "-m",
+                "locked",
+            ],
+            &[
+                ("PATH", &path_env),
+                ("HOME", &home_env),
+                ("SGIT_FAKE_VERDICT", "1"),
+            ],
         );
         assert!(
             !no_verify.status.success(),
@@ -685,7 +735,11 @@ mod tests {
         // Approved biometric → commit succeeds.
         let approved = run(
             &["commit", "-q", "--allow-empty", "-m", "locked"],
-            &[("PATH", &path_env), ("HOME", &home_env), ("SGIT_FAKE_VERDICT", "0")],
+            &[
+                ("PATH", &path_env),
+                ("HOME", &home_env),
+                ("SGIT_FAKE_VERDICT", "0"),
+            ],
         );
         assert!(
             approved.status.success(),

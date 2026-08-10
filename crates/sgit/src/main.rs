@@ -390,7 +390,10 @@ mod tests {
     fn promoted_verbs_are_visible_in_top_level_help() {
         let help = Cli::command().render_help().to_string();
         for verb in ["clone", "open", "create", "checkout"] {
-            assert!(help.contains(verb), "top-level help missing '{verb}':\n{help}");
+            assert!(
+                help.contains(verb),
+                "top-level help missing '{verb}':\n{help}"
+            );
         }
     }
 
@@ -399,22 +402,43 @@ mod tests {
         assert!(matches!(
             parse(&["sgit", "worktree", "lock"]).command,
             Commands::Worktree {
-                command: WorktreeCommands::Lock { off: false, repo: None, branch: None, json: false }
+                command: WorktreeCommands::Lock {
+                    off: false,
+                    repo: None,
+                    branch: None,
+                    json: false
+                }
             }
         ));
         assert!(matches!(
             parse(&[
-                "sgit", "worktree", "lock", "--off", "--repo", "acme/widget", "--branch", "main"
+                "sgit",
+                "worktree",
+                "lock",
+                "--off",
+                "--repo",
+                "acme/widget",
+                "--branch",
+                "main"
             ])
             .command,
             Commands::Worktree {
-                command: WorktreeCommands::Lock { off: true, repo: Some(_), branch: Some(_), .. }
+                command: WorktreeCommands::Lock {
+                    off: true,
+                    repo: Some(_),
+                    branch: Some(_),
+                    ..
+                }
             }
         ));
         assert!(matches!(
             parse(&["sgit", "repo", "lock"]).command,
             Commands::Repo {
-                command: RepoCommands::Lock { off: false, repo: None, json: false }
+                command: RepoCommands::Lock {
+                    off: false,
+                    repo: None,
+                    json: false
+                }
             }
         ));
         assert!(matches!(
@@ -438,13 +462,19 @@ mod tests {
             .expect("worktree group")
             .render_help()
             .to_string();
-        assert!(worktree_help.contains("lock"), "worktree help missing lock:\n{worktree_help}");
+        assert!(
+            worktree_help.contains("lock"),
+            "worktree help missing lock:\n{worktree_help}"
+        );
         let repo_help = Cli::command()
             .find_subcommand_mut("repo")
             .expect("repo group")
             .render_help()
             .to_string();
-        assert!(repo_help.contains("lock"), "repo help missing lock:\n{repo_help}");
+        assert!(
+            repo_help.contains("lock"),
+            "repo help missing lock:\n{repo_help}"
+        );
     }
 
     #[test]

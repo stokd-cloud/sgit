@@ -17,7 +17,8 @@ fn exit_with(message: &str) -> ! {
 }
 
 fn cwd() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|error| exit_with(&format!("cannot resolve cwd: {error}")))
+    std::env::current_dir()
+        .unwrap_or_else(|error| exit_with(&format!("cannot resolve cwd: {error}")))
 }
 
 fn registry_path() -> PathBuf {
@@ -43,11 +44,16 @@ fn resolve_target_common(repo: Option<&str>) -> PathBuf {
                     layout.bare_dir.display()
                 ));
             }
-            resolve_common_git_dir(&layout.bare_dir)
-                .unwrap_or_else(|| exit_with(&format!("not a git repository: {}", layout.bare_dir.display())))
+            resolve_common_git_dir(&layout.bare_dir).unwrap_or_else(|| {
+                exit_with(&format!(
+                    "not a git repository: {}",
+                    layout.bare_dir.display()
+                ))
+            })
         }
-        None => resolve_common_git_dir(&cwd())
-            .unwrap_or_else(|| exit_with("not inside a git repository (or pass --repo owner/name)")),
+        None => resolve_common_git_dir(&cwd()).unwrap_or_else(|| {
+            exit_with("not inside a git repository (or pass --repo owner/name)")
+        }),
     }
 }
 
@@ -82,7 +88,10 @@ fn report(common: &Path, entry: &str, off: bool, json: bool) {
             "locked": !off,
             "effective_locks": effective.entries().collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
         return;
     }
     let what = if entry == LOCK_WILDCARD {
@@ -148,7 +157,10 @@ pub fn run_list(json: bool) {
             "repo": common.display().to_string(),
             "effective_locks": effective.entries().collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
         return;
     }
     if effective.is_empty() {

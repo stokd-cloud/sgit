@@ -124,7 +124,10 @@ pub fn local_owners_for_repo(cfg: &RepositoriesConfig, repo: &str) -> Vec<String
 
 /// Actionable message for a resolution that did not land on a single owner.
 /// Returns `None` when the resolution succeeded.
-pub fn describe_owner_resolution_failure(repo: &str, resolution: &OwnerResolution) -> Option<String> {
+pub fn describe_owner_resolution_failure(
+    repo: &str,
+    resolution: &OwnerResolution,
+) -> Option<String> {
     match resolution {
         OwnerResolution::Resolved { .. } => None,
         OwnerResolution::NotFound => Some(format!(
@@ -249,8 +252,8 @@ mod tests {
         assert!(msg.contains("beta/sgit"), "{msg}");
         assert!(msg.contains("<owner/repo>"), "{msg}");
 
-        let missing = describe_owner_resolution_failure("sgit", &OwnerResolution::NotFound)
-            .expect("message");
+        let missing =
+            describe_owner_resolution_failure("sgit", &OwnerResolution::NotFound).expect("message");
         assert!(missing.contains("sgit"), "{missing}");
         assert!(missing.contains("<owner/repo>"), "{missing}");
 

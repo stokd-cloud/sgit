@@ -86,15 +86,18 @@ mod macos {
         let key_size = core_foundation::number::CFNumber::from(256i32);
         let label = CFString::new(KEY_LABEL);
         let params: CFDictionary = CFMutableDictionary::from_CFType_pairs(&[
-            (unsafe { kSecAttrKeyType }.to_void(), unsafe {
-                kSecAttrKeyTypeECSECPrimeRandom
-            }
-            .to_void()),
-            (unsafe { kSecAttrKeySizeInBits }.to_void(), key_size.to_void()),
-            (unsafe { kSecAttrTokenID }.to_void(), unsafe {
-                kSecAttrTokenIDSecureEnclave
-            }
-            .to_void()),
+            (
+                unsafe { kSecAttrKeyType }.to_void(),
+                unsafe { kSecAttrKeyTypeECSECPrimeRandom }.to_void(),
+            ),
+            (
+                unsafe { kSecAttrKeySizeInBits }.to_void(),
+                key_size.to_void(),
+            ),
+            (
+                unsafe { kSecAttrTokenID }.to_void(),
+                unsafe { kSecAttrTokenIDSecureEnclave }.to_void(),
+            ),
             (unsafe { kSecAttrLabel }.to_void(), label.to_void()),
             (
                 unsafe { kSecPrivateKeyAttrs }.to_void(),

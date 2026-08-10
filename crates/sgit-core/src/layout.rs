@@ -147,10 +147,7 @@ pub fn bare_placeholder_branch() -> &'static str {
 
 /// Point a freshly-cloned bare repo's HEAD at [`BARE_PLACEHOLDER_HEAD`].
 pub fn point_bare_head_to_placeholder(bare_dir: &Path) -> Result<(), String> {
-    run_git_dir(
-        bare_dir,
-        &["symbolic-ref", "HEAD", BARE_PLACEHOLDER_HEAD],
-    )
+    run_git_dir(bare_dir, &["symbolic-ref", "HEAD", BARE_PLACEHOLDER_HEAD])
 }
 
 /// Bare-clone from `remote_url` into `bare_dir`, configure fetch refspec,
@@ -320,12 +317,7 @@ fn prune_worktree_registration(bare: &Path, worktree: &Path) {
         .current_dir(bare)
         .output();
     let _ = Command::new("git")
-        .args([
-            "worktree",
-            "remove",
-            "--force",
-            &worktree.to_string_lossy(),
-        ])
+        .args(["worktree", "remove", "--force", &worktree.to_string_lossy()])
         .current_dir(bare)
         .output();
 }

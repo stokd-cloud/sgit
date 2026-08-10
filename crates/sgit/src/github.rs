@@ -32,7 +32,8 @@ pub fn authenticated_login(token: &str) -> Option<String> {
 
 /// Org logins the authenticated user belongs to (`GET /user/orgs`).
 fn authenticated_orgs(token: &str) -> Vec<String> {
-    let Some(value) = github_get_json(token, "https://api.github.com/user/orgs?per_page=100") else {
+    let Some(value) = github_get_json(token, "https://api.github.com/user/orgs?per_page=100")
+    else {
         return Vec::new();
     };
     value
@@ -87,7 +88,9 @@ fn github_get_json(token: &str, url: &str) -> Option<serde_json::Value> {
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
-    reqwest::blocking::Client::builder().use_rustls_tls().build()
+    reqwest::blocking::Client::builder()
+        .use_rustls_tls()
+        .build()
 }
 
 /// Resolve a GitHub token: `GITHUB_TOKEN` env, then `gh auth token`.

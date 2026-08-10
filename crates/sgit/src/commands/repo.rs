@@ -21,7 +21,7 @@ use sgit_core::{
     load_repositories_config, local_owners_for_repo, move_bare, move_worktree, normalize_path,
     parse_repo_spec, render_worktree_name_pattern, resolve_default_branch, resolve_owner_chain,
     resolve_repo_layout, run_git_dir, worktree_dir_for_branch, ApplyStatus, OwnerResolution,
-    RepositoriesConfig, RepoLayout, RepoSpec, WorktreeRepairTarget,
+    RepoLayout, RepoSpec, RepositoriesConfig, WorktreeRepairTarget,
 };
 
 use crate::github::{
@@ -69,7 +69,10 @@ fn resolve_existing_repo_arg(repo_spec: &str, cfg: &RepositoriesConfig) -> (Stri
     let OwnerResolution::Resolved { owner, source } = resolution else {
         unreachable!("failure described above");
     };
-    eprintln!("# resolved '{repo}' to {owner}/{repo} via {}", source.label());
+    eprintln!(
+        "# resolved '{repo}' to {owner}/{repo} via {}",
+        source.label()
+    );
     (owner, repo)
 }
 
@@ -291,10 +294,7 @@ pub fn run_clone(repo_spec: &str, json: bool) {
         });
         println!("{rendered}");
     } else {
-        println!(
-            "\nRepository {}/{} is ready.",
-            result.owner, result.repo
-        );
+        println!("\nRepository {}/{} is ready.", result.owner, result.repo);
         println!("  Bare clone: {}", result.bare_repo_path);
         println!("  Worktree:   {}", result.worktree_path);
     }
@@ -439,7 +439,9 @@ fn editor_cli_from_app_path(path: &str) -> Option<String> {
 fn resolve_open_editor_cli<F: Fn(&str) -> Option<String>>(getenv: F) -> String {
     // Prefer explicit EDITOR/VISUAL for headless/stub verification, then ambient
     // VS Code-family terminal, then stokd-code/code.
-    if let Some(ed) = getenv("SGIT_EDITOR").or_else(|| getenv("EDITOR")).or_else(|| getenv("VISUAL"))
+    if let Some(ed) = getenv("SGIT_EDITOR")
+        .or_else(|| getenv("EDITOR"))
+        .or_else(|| getenv("VISUAL"))
     {
         let ed = ed.trim().to_string();
         if !ed.is_empty() {
@@ -757,8 +759,7 @@ fn mirror_copy_bare_to_new_remote(
         ])
         .output();
 
-    let push_url =
-        format!("https://x-access-token:{token}@github.com/{new_owner}/{new_repo}.git");
+    let push_url = format!("https://x-access-token:{token}@github.com/{new_owner}/{new_repo}.git");
     println!("Mirror-pushing full history to {new_owner}/{new_repo}...");
     let out = Command::new("git")
         .args([
@@ -901,7 +902,9 @@ pub fn run_rename(repo_spec: &str, new_repo_spec: &str) {
         list_linked_worktrees(&old_layout.bare_dir)
     };
 
-    let plan = plan_repo_rename(&cfg, &old_owner, &old_repo, &new_owner, &new_repo, &worktrees);
+    let plan = plan_repo_rename(
+        &cfg, &old_owner, &old_repo, &new_owner, &new_repo, &worktrees,
+    );
 
     if plan.bare_to.exists() {
         die(format!(
@@ -1035,8 +1038,16 @@ mod tests {
         );
 
         // Worktree presence markers and the invalid-dir flag are visible.
-        assert!(rows[1].contains('✓'), "existing worktree marked: {}", rows[1]);
-        assert!(rows[2].contains('✗'), "missing worktree marked: {}", rows[2]);
+        assert!(
+            rows[1].contains('✓'),
+            "existing worktree marked: {}",
+            rows[1]
+        );
+        assert!(
+            rows[2].contains('✗'),
+            "missing worktree marked: {}",
+            rows[2]
+        );
         assert!(
             rows[3].contains('!') && rows[3].contains("not a git repo"),
             "invalid dir flagged: {}",

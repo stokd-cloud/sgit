@@ -20,9 +20,8 @@ impl ConflictResolver for EditorConflictResolver {
         // Invocation marker for self-check / VAL-SGIT-SHOVE-003 evidence.
         if let Ok(marker) = std::env::var("SGIT_RESOLVER_MARKER") {
             if !marker.is_empty() {
-                std::fs::write(&marker, "sgit-conflict-resolver-invoked\n").map_err(|e| {
-                    format!("failed to write SGIT_RESOLVER_MARKER ({marker}): {e}")
-                })?;
+                std::fs::write(&marker, "sgit-conflict-resolver-invoked\n")
+                    .map_err(|e| format!("failed to write SGIT_RESOLVER_MARKER ({marker}): {e}"))?;
             }
         }
 

@@ -8,7 +8,7 @@ use sgit_core::{
     classify_checkout_target_with_cfg, describe_owner_resolution_failure, detect_repo_root_at,
     ensure_branch_worktree, ensure_repo_main_worktree, load_repositories_config,
     local_owners_for_repo, parse_repo_spec, resolve_owner_chain, CheckoutKind, OwnerResolution,
-    RepositoriesConfig, RepoSpec,
+    RepoSpec, RepositoriesConfig,
 };
 
 use crate::github::{github_owner_chain, owners_with_remote_repo, resolve_github_token};

@@ -18,8 +18,10 @@ use crate::layout::{
     render_worktree_name_pattern, resolve_default_branch, resolve_repo_layout,
     worktree_dir_for_branch,
 };
+use crate::workspace::{
+    detect_repo_root_at, find_worktree_for_branch_at, resolve_default_branch_at,
+};
 use crate::worktree_pin::{resolve_common_git_dir, write_pin_marker};
-use crate::workspace::{detect_repo_root_at, find_worktree_for_branch_at, resolve_default_branch_at};
 
 /// Outcome of ensuring a worktree for a branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +113,9 @@ pub fn classify_checkout_target_with_cfg(
     // clone fails while still inside a git repo.
     if let Some((owner, repo)) = trimmed.split_once('/') {
         if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') {
-            if cfg.map(|c| local_repo_layout_exists(c, trimmed)).unwrap_or(false)
+            if cfg
+                .map(|c| local_repo_layout_exists(c, trimmed))
+                .unwrap_or(false)
                 || looks_like_owner_repo_pair(owner, repo)
             {
                 return CheckoutKind::RepoSpec(trimmed.to_string());
@@ -211,18 +215,10 @@ pub fn ensure_repo_main_worktree_from_url(
 ) -> Result<EnsureRepoWorktree, String> {
     // Layout roots must exist so later create_dir_all on nested parents never
     // fails with "can't write to a folder that isn't there".
-    std::fs::create_dir_all(&cfg.bare_root).map_err(|e| {
-        format!(
-            "cannot create bareRoot {}: {e}",
-            cfg.bare_root
-        )
-    })?;
-    std::fs::create_dir_all(&cfg.worktree_root).map_err(|e| {
-        format!(
-            "cannot create worktreeRoot {}: {e}",
-            cfg.worktree_root
-        )
-    })?;
+    std::fs::create_dir_all(&cfg.bare_root)
+        .map_err(|e| format!("cannot create bareRoot {}: {e}", cfg.bare_root))?;
+    std::fs::create_dir_all(&cfg.worktree_root)
+        .map_err(|e| format!("cannot create worktreeRoot {}: {e}", cfg.worktree_root))?;
 
     let mut layout = resolve_repo_layout(cfg, owner, repo_name);
     let mut source_parts: Vec<String> = Vec::new();
@@ -286,12 +282,7 @@ fn safe_remove_invalid_worktree_dir(path: &Path, bare_dir: &Path) -> Result<(), 
         .current_dir(bare_dir)
         .output();
     let _ = Command::new("git")
-        .args([
-            "worktree",
-            "remove",
-            "--force",
-            &path.to_string_lossy(),
-        ])
+        .args(["worktree", "remove", "--force", &path.to_string_lossy()])
         .current_dir(bare_dir)
         .output();
 
@@ -300,19 +291,14 @@ fn safe_remove_invalid_worktree_dir(path: &Path, bare_dir: &Path) -> Result<(), 
     }
 
     if is_dir_empty(path) {
-        std::fs::remove_dir_all(path).map_err(|e| {
-            format!("cannot remove empty worktree path {}: {e}", path.display())
-        })?;
+        std::fs::remove_dir_all(path)
+            .map_err(|e| format!("cannot remove empty worktree path {}: {e}", path.display()))?;
         return Ok(());
     }
 
     if only_broken_git_marker(path) {
-        std::fs::remove_dir_all(path).map_err(|e| {
-            format!(
-                "cannot remove broken worktree path {}: {e}",
-                path.display()
-            )
-        })?;
+        std::fs::remove_dir_all(path)
+            .map_err(|e| format!("cannot remove broken worktree path {}: {e}", path.display()))?;
         return Ok(());
     }
 
@@ -407,12 +393,8 @@ pub fn ensure_branch_worktree(
     cfg: &RepositoriesConfig,
 ) -> Result<EnsureBranchWorktree, String> {
     let branch = normalize_branch_name(branch)?;
-    let repo_root = detect_repo_root_at(cwd).ok_or_else(|| {
-        format!(
-            "not inside a git repository: {}",
-            cwd.display()
-        )
-    })?;
+    let repo_root = detect_repo_root_at(cwd)
+        .ok_or_else(|| format!("not inside a git repository: {}", cwd.display()))?;
 
     // Reuse an existing worktree for this branch (any location).
     if let Ok(existing) = find_worktree_for_branch_at(&repo_root, &branch) {
@@ -445,9 +427,12 @@ pub fn ensure_branch_worktree(
 
     // Submodule policy (best-effort).
     if let Some((owner, repo)) = detect_owner_repo(&repo_root) {
-        if let Err(e) =
-            crate::submodule_checkout::apply_submodule_checkout_for_repo(&created_path, cfg, &owner, &repo)
-        {
+        if let Err(e) = crate::submodule_checkout::apply_submodule_checkout_for_repo(
+            &created_path,
+            cfg,
+            &owner,
+            &repo,
+        ) {
             eprintln!("warning: submodule checkout: {e}");
         }
     }
@@ -471,16 +456,11 @@ fn create_branch_worktree(
         .current_dir(repo_root)
         .output();
 
-    let common = resolve_common_git_dir(repo_root)
-        .unwrap_or_else(|| repo_root.to_path_buf());
+    let common = resolve_common_git_dir(repo_root).unwrap_or_else(|| repo_root.to_path_buf());
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "cannot create worktree parent {}: {e}",
-                parent.display()
-            )
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create worktree parent {}: {e}", parent.display()))?;
     }
 
     let path_str = path.to_string_lossy().to_string();
@@ -676,12 +656,14 @@ mod tests {
             canonicalize_existing(&wt)
         );
         // No path under configured worktree root was created for the reuse case.
-        assert!(!PathBuf::from(&cfg.worktree_root).join("local").exists()
-            || !PathBuf::from(&cfg.worktree_root)
-                .join("local")
-                .join("primary")
-                .join("feature-x")
-                .exists());
+        assert!(
+            !PathBuf::from(&cfg.worktree_root).join("local").exists()
+                || !PathBuf::from(&cfg.worktree_root)
+                    .join("local")
+                    .join("primary")
+                    .join("feature-x")
+                    .exists()
+        );
     }
 
     #[test]
@@ -721,11 +703,7 @@ mod tests {
         // Path leaf matches branch name under local/<repo>/ when no origin.
         assert!(
             result.path.ends_with("brand-new")
-                || result
-                    .path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    == Some("brand-new"),
+                || result.path.file_name().and_then(|n| n.to_str()) == Some("brand-new"),
             "path should end with brand-new: {}",
             result.path.display()
         );
@@ -735,10 +713,7 @@ mod tests {
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .output()
             .unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&branch.stdout).trim(),
-            "brand-new"
-        );
+        assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "brand-new");
     }
 
     #[test]
@@ -778,8 +753,12 @@ mod tests {
             CheckoutKind::RepoSpec("acme/widget".into())
         );
         // Local layout present → still repo.
-        std::fs::create_dir_all(PathBuf::from(&cfg.worktree_root).join("acme").join("widget"))
-            .unwrap();
+        std::fs::create_dir_all(
+            PathBuf::from(&cfg.worktree_root)
+                .join("acme")
+                .join("widget"),
+        )
+        .unwrap();
         assert_eq!(
             classify_checkout_target_with_cfg("acme/widget", Some(&primary), Some(&cfg)),
             CheckoutKind::RepoSpec("acme/widget".into())
@@ -870,7 +849,12 @@ mod tests {
         assert!(result.created);
         assert!(result.path.is_dir());
         assert!(
-            is_valid_linked_worktree(&result.path, &PathBuf::from(&cfg.bare_root).join("acme").join("widget.git")),
+            is_valid_linked_worktree(
+                &result.path,
+                &PathBuf::from(&cfg.bare_root)
+                    .join("acme")
+                    .join("widget.git")
+            ),
             "main worktree must have a git connection to the bare"
         );
         let inside = Command::new("git")
@@ -911,7 +895,9 @@ mod tests {
         assert!(result.created);
         assert!(is_valid_linked_worktree(
             &result.path,
-            &PathBuf::from(&cfg.bare_root).join("acme").join("widget.git")
+            &PathBuf::from(&cfg.bare_root)
+                .join("acme")
+                .join("widget.git")
         ));
     }
 
@@ -933,7 +919,9 @@ mod tests {
         assert!(again.created);
         assert!(is_valid_linked_worktree(
             &again.path,
-            &PathBuf::from(&cfg.bare_root).join("acme").join("widget.git")
+            &PathBuf::from(&cfg.bare_root)
+                .join("acme")
+                .join("widget.git")
         ));
     }
 
@@ -944,7 +932,9 @@ mod tests {
         let (_remote, url) = seed_remote_repo(tmp.path());
 
         // Bare must exist so we hit the worktree path (not bare clone failure).
-        let bare = PathBuf::from(&cfg.bare_root).join("acme").join("widget.git");
+        let bare = PathBuf::from(&cfg.bare_root)
+            .join("acme")
+            .join("widget.git");
         bare_clone_from_url(&url, &bare).unwrap();
 
         let dest = PathBuf::from(&cfg.worktree_root)
@@ -960,6 +950,9 @@ mod tests {
             err.contains("no git connection") || err.contains("move or remove"),
             "err was: {err}"
         );
-        assert!(dest.join("precious.txt").is_file(), "must not destroy content");
+        assert!(
+            dest.join("precious.txt").is_file(),
+            "must not destroy content"
+        );
     }
 }

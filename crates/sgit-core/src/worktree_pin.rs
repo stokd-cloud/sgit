@@ -188,7 +188,9 @@ pub fn reconcile(anchor: &Path, off: bool) -> ReconcileResult {
         } else {
             match write_pin_marker(&wt) {
                 Ok(true) => r.pinned.push(wt),
-                Ok(false) => r.skipped.push((wt, "no branch to infer for pinning".into())),
+                Ok(false) => r
+                    .skipped
+                    .push((wt, "no branch to infer for pinning".into())),
                 Err(e) => r.skipped.push((wt, e.to_string())),
             }
         }
@@ -235,12 +237,8 @@ pub fn install_reference_transaction_hook(anchor: &Path) -> Result<PathBuf, Stri
         .ok_or_else(|| format!("not a git repository: {}", anchor.display()))?;
 
     let hooks_dir = resolve_hooks_dir_for_pin(&common)?;
-    std::fs::create_dir_all(&hooks_dir).map_err(|e| {
-        format!(
-            "failed to create hooks dir {}: {e}",
-            hooks_dir.display()
-        )
-    })?;
+    std::fs::create_dir_all(&hooks_dir)
+        .map_err(|e| format!("failed to create hooks dir {}: {e}", hooks_dir.display()))?;
 
     let script_path = hooks_dir.join("reference-transaction");
     let content = reference_transaction_script(PIN_HOOKS_VERSION);
@@ -268,11 +266,7 @@ pub(crate) fn resolve_hooks_dir_for_pin(common_dir: &Path) -> Result<PathBuf, St
 
     // Fresh sgit-managed dir + point core.hooksPath at it.
     let sgit_hooks = common_dir.join(SGIT_HOOKS_SUBDIR);
-    git_config_set(
-        common_dir,
-        "core.hooksPath",
-        &sgit_hooks.to_string_lossy(),
-    )?;
+    git_config_set(common_dir, "core.hooksPath", &sgit_hooks.to_string_lossy())?;
     Ok(sgit_hooks)
 }
 
@@ -458,7 +452,14 @@ mod tests {
         let wt = tmp.path().join("wt");
         git(
             &primary,
-            &["worktree", "add", "-q", "-b", "pinned", wt.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "pinned",
+                wt.to_str().unwrap(),
+            ],
         );
         (tmp, primary, wt)
     }
@@ -575,7 +576,10 @@ mod tests {
     fn pin_refusal_states_rule_and_advertises_no_off_switch() {
         let s = reference_transaction_script(PIN_HOOKS_VERSION);
         for leak in ["to unpin", "pin --off", "pinBranch", "ask the human"] {
-            assert!(!s.contains(leak), "pin refusal leaks an off-switch: {leak:?}");
+            assert!(
+                !s.contains(leak),
+                "pin refusal leaks an off-switch: {leak:?}"
+            );
         }
         assert!(s.contains("a worktree directory must match its branch"));
         assert!(s.contains("NEVER repoint a worktree folder at a different branch"));
