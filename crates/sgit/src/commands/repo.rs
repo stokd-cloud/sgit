@@ -484,10 +484,9 @@ pub fn run_create(repo_spec: &str, source_path: Option<&str>, force: bool, prefe
     });
 
     let cfg = load_cfg();
-    let RepoLayout {
-        bare_dir,
-        worktree_dir,
-    } = resolve_repo_layout(&cfg, &owner, &repo_name);
+    // The worktree leaf is recomputed from the bare's real default branch once
+    // the clone lands, so only the bare path is needed here.
+    let RepoLayout { bare_dir, .. } = resolve_repo_layout(&cfg, &owner, &repo_name);
 
     let github_token = resolve_github_token().unwrap_or_else(|| {
         die("no GitHub token available. Set GITHUB_TOKEN or authenticate with `gh auth login`.");
@@ -510,8 +509,13 @@ pub fn run_create(repo_spec: &str, source_path: Option<&str>, force: bool, prefe
     println!("Creating bare clone at {}...", bare_dir.display());
     bare_clone(&owner, &repo_name, &bare_dir).unwrap_or_else(|e| die(e));
 
+    // Derive the branch from the freshly cloned bare rather than assuming
+    // "main", and recompute the leaf from it — same as run_clone / run_open.
+    let branch = resolve_default_branch(&bare_dir);
+    let worktree_dir = worktree_dir_for_branch(&cfg, &owner, &repo_name, &branch);
+
     println!("Creating main worktree at {}...", worktree_dir.display());
-    create_worktree(&bare_dir, &worktree_dir, "main", true).unwrap_or_else(|e| die(e));
+    create_worktree(&bare_dir, &worktree_dir, &branch, true).unwrap_or_else(|e| die(e));
 
     println!("Setting main as default branch...");
     set_default_branch(&github_token, &owner, &repo_name);

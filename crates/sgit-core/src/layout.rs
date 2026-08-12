@@ -191,8 +191,81 @@ pub fn bare_clone_from_url(remote_url: &str, bare_dir: &Path) -> Result<(), Stri
         write_default_branch_config(bare_dir, &branch);
     }
 
+    ensure_origin_head(bare_dir);
+
     point_bare_head_to_placeholder(bare_dir)?;
     Ok(())
+}
+
+/// Populate `refs/remotes/origin/*` and resolve `refs/remotes/origin/HEAD`.
+///
+/// `git clone --bare` writes neither: it lands branches in `refs/heads/*` and
+/// never records the remote's advertised HEAD. Readers of the primary branch
+/// (`resolve_default_branch_at`, `resolve_primary_base_ref`) consult
+/// `origin/HEAD` first and silently fall through to a guess-ladder without it.
+///
+/// Best-effort: an unreachable remote warns and still leaves a usable hub.
+pub fn ensure_origin_head(bare_dir: &Path) {
+    // Objects are already local after the clone, so this only moves refs.
+    if let Err(e) = run_git_dir(bare_dir, &["fetch", "origin"]) {
+        eprintln!(
+            "warning: could not fetch origin refs for {}: {e}",
+            bare_dir.display()
+        );
+        return;
+    }
+
+    if let Err(e) = run_git_dir(bare_dir, &["remote", "set-head", "origin", "--auto"]) {
+        eprintln!(
+            "warning: could not resolve refs/remotes/origin/HEAD for {}: {e}",
+            bare_dir.display()
+        );
+    }
+}
+
+/// Configure upstream tracking for `branch` in `worktree_dir`.
+///
+/// `git worktree add <path> <branch>` never sets upstream, so a freshly
+/// provisioned tree has no `branch.<b>.remote` / `branch.<b>.merge` and
+/// `git pull` / bare `git push` / ahead-behind are all broken until some later
+/// push repairs it.
+///
+/// No-op when the branch does not exist on origin — a not-yet-pushed branch
+/// must not be given an upstream that does not resolve. No-op when upstream is
+/// already configured. Best-effort: failures warn, never abort provisioning.
+pub fn ensure_branch_upstream(bare_dir: &Path, worktree_dir: &Path, branch: &str) {
+    if !git_ref_exists(bare_dir, &format!("refs/remotes/origin/{branch}")) {
+        return;
+    }
+
+    let already_set = Command::new("git")
+        .arg("-C")
+        .arg(worktree_dir)
+        .args(["rev-parse", "--abbrev-ref", &format!("{branch}@{{upstream}}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if already_set {
+        return;
+    }
+
+    let remote_key = format!("branch.{branch}.remote");
+    let merge_key = format!("branch.{branch}.merge");
+    let merge_ref = format!("refs/heads/{branch}");
+    let writes: [[&str; 3]; 2] = [
+        ["config", &remote_key, "origin"],
+        ["config", &merge_key, &merge_ref],
+    ];
+
+    for args in writes {
+        if let Err(e) = run_git_dir(worktree_dir, &args) {
+            eprintln!(
+                "warning: could not set upstream for {branch} in {}: {e}",
+                worktree_dir.display()
+            );
+            return;
+        }
+    }
 }
 
 /// Bare-clone `owner/repo` from GitHub (SSH URL).
@@ -300,6 +373,8 @@ pub fn create_worktree(
             bare_dir.display()
         ));
     }
+
+    ensure_branch_upstream(bare_dir, worktree_dir, branch);
 
     if pin {
         if let Err(e) = crate::worktree_pin::write_pin_marker(worktree_dir) {
@@ -572,5 +647,128 @@ mod tests {
             Some(("owner".into(), "repo".into()))
         );
         assert_eq!(parse_git_remote_url("not-a-url"), None);
+    }
+
+    // --- AX-CLI-PROVISION-REMOTE-STATE ---------------------------------------
+
+    fn git_ok(cwd: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run git {}: {e}", args.join(" ")));
+        assert!(
+            out.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
+        Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    }
+
+    /// Seed a non-bare repo with one commit on `main`, usable as a local "origin".
+    fn seed_remote(dir: &Path) -> PathBuf {
+        let remote = dir.join("seed");
+        std::fs::create_dir_all(&remote).unwrap();
+        git_ok(&remote, &["init", "-b", "main"]);
+        git_ok(&remote, &["config", "user.email", "test@example.com"]);
+        git_ok(&remote, &["config", "user.name", "Test"]);
+        std::fs::write(remote.join("README.md"), "seed\n").unwrap();
+        git_ok(&remote, &["add", "-A"]);
+        git_ok(&remote, &["commit", "-m", "Initial commit"]);
+        remote
+    }
+
+    #[test]
+    fn bare_clone_sets_origin_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = seed_remote(tmp.path());
+        let bare = tmp.path().join("hub.git");
+
+        bare_clone_from_url(&remote.to_string_lossy(), &bare).unwrap();
+
+        let head = git_stdout(
+            &bare,
+            &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+        );
+        assert_eq!(
+            head.as_deref(),
+            Some("refs/remotes/origin/main"),
+            "freshly provisioned hub must carry an authoritative refs/remotes/origin/HEAD"
+        );
+    }
+
+    #[test]
+    fn create_worktree_sets_upstream_for_existing_remote_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = seed_remote(tmp.path());
+        let bare = tmp.path().join("hub.git");
+        bare_clone_from_url(&remote.to_string_lossy(), &bare).unwrap();
+
+        let wt = tmp.path().join("worktrees").join("main");
+        create_worktree(&bare, &wt, "main", false).unwrap();
+
+        let upstream = git_stdout(&wt, &["rev-parse", "--abbrev-ref", "main@{upstream}"]);
+        assert_eq!(
+            upstream.as_deref(),
+            Some("origin/main"),
+            "a worktree for a branch that exists on origin must be push/pull-ready"
+        );
+    }
+
+    #[test]
+    fn create_worktree_leaves_upstream_unset_for_local_only_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = seed_remote(tmp.path());
+        let bare = tmp.path().join("hub.git");
+        bare_clone_from_url(&remote.to_string_lossy(), &bare).unwrap();
+
+        // A branch that exists only locally — never pushed to origin.
+        git_ok(&bare, &["branch", "local-only", "main"]);
+
+        let wt = tmp.path().join("worktrees").join("local-only");
+        create_worktree(&bare, &wt, "local-only", false).unwrap();
+
+        assert_eq!(
+            git_stdout(&wt, &["rev-parse", "--abbrev-ref", "local-only@{upstream}"]),
+            None,
+            "a branch absent from origin must not be given a bogus upstream"
+        );
+        assert_eq!(
+            git_stdout(&wt, &["config", "--get", "branch.local-only.merge"]),
+            None,
+            "no upstream config may be written for a local-only branch"
+        );
+    }
+
+    #[test]
+    fn create_worktree_succeeds_when_origin_is_unreachable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = seed_remote(tmp.path());
+        let bare = tmp.path().join("hub.git");
+        bare_clone_from_url(&remote.to_string_lossy(), &bare).unwrap();
+
+        // Remote goes away after provisioning: origin/* refs are stale but no
+        // fetch or set-head can succeed.
+        std::fs::remove_dir_all(&remote).unwrap();
+
+        let wt = tmp.path().join("worktrees").join("main");
+        create_worktree(&bare, &wt, "main", false)
+            .expect("an unreachable remote must degrade, not fail provisioning");
+        assert!(is_valid_linked_worktree(&wt, &bare));
+
+        // ensure_origin_head is likewise non-fatal on a dead remote.
+        ensure_origin_head(&bare);
     }
 }
