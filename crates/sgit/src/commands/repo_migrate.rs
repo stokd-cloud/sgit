@@ -4645,7 +4645,7 @@ mod tests {
             from: src.clone(),
             to: dst.clone(),
         };
-        let (safe, rejected) = preflight(&[action.clone()]);
+        let (safe, rejected) = preflight(std::slice::from_ref(&action));
         assert!(safe.is_empty(), "an existing-dest action must not be safe");
         assert_eq!(rejected, vec![(action, UnsafeReason::DestinationExists)]);
     }
@@ -4662,7 +4662,7 @@ mod tests {
             from: src.clone(),
             to: dst.clone(),
         };
-        let (safe, rejected) = preflight(&[action.clone()]);
+        let (safe, rejected) = preflight(std::slice::from_ref(&action));
         assert!(safe.is_empty());
         assert_eq!(rejected, vec![(action, UnsafeReason::DestinationExists)]);
     }
@@ -4704,7 +4704,7 @@ mod tests {
             from: src,
             to: tmp.path().join("nested/dst.git"), // does not exist, not nested in src
         };
-        let (safe, rejected) = preflight(&[action.clone()]);
+        let (safe, rejected) = preflight(std::slice::from_ref(&action));
         assert_eq!(safe, vec![action]);
         assert!(rejected.is_empty());
     }
@@ -5503,7 +5503,7 @@ mod tests {
             from: winner_from.clone(),
             to: other_existing.clone(),
         };
-        let (safe2, rejected2) = preflight(&[collide.clone()]);
+        let (safe2, rejected2) = preflight(std::slice::from_ref(&collide));
         assert!(safe2.is_empty());
         assert_eq!(rejected2, vec![(collide, UnsafeReason::DestinationExists)]);
     }

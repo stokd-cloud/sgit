@@ -90,6 +90,15 @@ enum Commands {
         #[arg(short, long)]
         message: Option<String>,
     },
+    /// Integrate origin: fast-forward, else rebase, else merge (with resolution)
+    Pull {
+        /// Refuse to rebase or merge — fast-forward only
+        #[arg(long, conflicts_with = "no_rebase")]
+        ff_only: bool,
+        /// Skip the rebase rung: fast-forward, else merge directly
+        #[arg(long)]
+        no_rebase: bool,
+    },
     /// Branch/repo lock inspection and hook plumbing
     Lock {
         #[command(subcommand)]
@@ -304,6 +313,7 @@ fn main() {
             command: LockCommands::Enforce { hook },
         } => commands::lock::run_enforce(&hook),
         Commands::Shove { message } => commands::shove::run(message),
+        Commands::Pull { ff_only, no_rebase } => commands::pull::run(ff_only, no_rebase),
     }
 }
 
@@ -445,6 +455,30 @@ mod tests {
             .render_help()
             .to_string();
         assert!(repo_help.contains("lock"), "repo help missing lock:\n{repo_help}");
+    }
+
+    #[test]
+    fn pull_parses_and_is_visible() {
+        assert!(matches!(
+            parse(&["sgit", "pull"]).command,
+            Commands::Pull {
+                ff_only: false,
+                no_rebase: false
+            }
+        ));
+        assert!(matches!(
+            parse(&["sgit", "pull", "--ff-only"]).command,
+            Commands::Pull { ff_only: true, .. }
+        ));
+        assert!(matches!(
+            parse(&["sgit", "pull", "--no-rebase"]).command,
+            Commands::Pull { no_rebase: true, .. }
+        ));
+        // The two knobs describe different rungs of the same ladder; asking for
+        // both is a contradiction, not a preference.
+        assert!(Cli::try_parse_from(["sgit", "pull", "--ff-only", "--no-rebase"]).is_err());
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("pull"), "top-level help missing 'pull':\n{help}");
     }
 
     #[test]

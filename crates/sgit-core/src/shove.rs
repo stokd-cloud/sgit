@@ -202,8 +202,25 @@ pub fn push_with_sync(
 /// Snapshot local HEAD and `origin/<branch>` (best-effort fetch first) as
 /// backup branches so a conflicting rebase cannot lose either side.
 pub fn create_shove_backup_branches(repo_root: &Path, branch: &str) -> Result<(), String> {
+    create_backup_branches(repo_root, branch, SHOVE_BACKUP_PREFIX).map(|_| ())
+}
+
+/// Backup-branch namespace for shove's both-sides snapshots.
+pub const SHOVE_BACKUP_PREFIX: &str = "sgit-shove-backup";
+
+/// Snapshot both sides under `prefix`, returning the branch names actually
+/// created as `(local, remote)`. `remote` is `None` when `origin/<branch>` does
+/// not exist yet — there is nothing on that side that could be lost.
+///
+/// A best-effort `git fetch origin <branch>` runs first so the remote snapshot
+/// records the tip about to be integrated rather than a stale one.
+pub fn create_backup_branches(
+    repo_root: &Path,
+    branch: &str,
+    prefix: &str,
+) -> Result<(String, Option<String>), String> {
     let stamp = backup_stamp();
-    let (local_backup, remote_backup) = shove_backup_branch_names(branch, &stamp);
+    let (local_backup, remote_backup) = backup_branch_names(branch, &stamp, prefix);
     // Local side first (always available).
     run_git(repo_root, &["branch", "-f", &local_backup, "HEAD"])?;
     // Remote side — fetch then point at origin/branch when present.
@@ -218,20 +235,25 @@ pub fn create_shove_backup_branches(repo_root: &Path, branch: &str) -> Result<()
             println!(
                 "Safety snapshots: {local_backup} (local); remote tip {remote_ref} unavailable."
             );
-            return Ok(());
+            return Ok((local_backup, None));
         }
     }
     println!("Safety snapshots: {local_backup} (local), {remote_backup} (origin/{branch}).");
-    Ok(())
+    Ok((local_backup, Some(remote_backup)))
 }
 
 /// Deterministic, distinct backup-branch names for BOTH sides of a shove
 /// rebase so conflicting resolution can never lose either side.
 pub fn shove_backup_branch_names(branch: &str, stamp: &str) -> (String, String) {
+    backup_branch_names(branch, stamp, SHOVE_BACKUP_PREFIX)
+}
+
+/// Deterministic, distinct `(local, remote)` backup-branch names under `prefix`.
+pub fn backup_branch_names(branch: &str, stamp: &str, prefix: &str) -> (String, String) {
     let safe = branch.replace('/', "-");
     (
-        format!("sgit-shove-backup/{safe}/{stamp}-local"),
-        format!("sgit-shove-backup/{safe}/{stamp}-remote"),
+        format!("{prefix}/{safe}/{stamp}-local"),
+        format!("{prefix}/{safe}/{stamp}-remote"),
     )
 }
 
