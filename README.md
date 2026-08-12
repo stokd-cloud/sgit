@@ -149,6 +149,43 @@ spellings still work as hidden back-compat aliases.
 
 ---
 
+## `sgit pull` — the escalation ladder
+
+`git pull` makes you pick a strategy up front, then punishes the wrong guess.
+`sgit pull` walks the strategies in order of increasing cost, so you only pay
+for the friction you actually hit:
+
+1. **Fast-forward.** Cannot conflict, cannot rewrite, cannot lose anything.
+2. **Rebase.** Linear history — but it replays each local commit separately, so
+   one textual conflict can be presented once *per replayed commit*.
+3. **Merge.** A merge commit, but it resolves **once** against the final tree.
+
+When the rebase conflicts, sgit aborts it (a stopped rebase has committed
+nothing, so nothing is lost) and retries as a merge — strictly less painful to
+resolve. Only if the *merge* conflicts does the conflict resolver run: `$EDITOR`
+in sgit, an agent in stokd.
+
+```bash
+sgit pull              # ff → rebase → merge
+sgit pull --ff-only    # refuse to escalate; fail instead
+sgit pull --no-rebase  # ff → merge, skipping the rebase rung
+```
+
+Safety properties:
+
+- **Missing upstream is set for you.** No more
+  `There is no tracking information for the current branch` — if
+  `origin/<branch>` exists, sgit points the branch at it and continues.
+- **Both sides are snapshotted** before any escalation, as
+  `sgit-pull-backup/<branch>/<stamp>-local` and `…-remote`. Neither side can be
+  lost even if resolution goes wrong.
+- **Never stashes.** A dirty tracked working tree is a hard refusal naming the
+  files, before anything is fetched or merged. Untracked files are fine.
+- **Failed resolution is left in place.** The conflicted merge, `MERGE_HEAD`,
+  and both backups stay put so you can finish by hand.
+
+---
+
 ## Local knowledge graph
 
 sgit includes a **local-first** repo knowledge graph. Data lives under your control (default file store under `~/.sgit/graph/…`, or optional Mongo). **No stokd account** is required.
