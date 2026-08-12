@@ -1,12 +1,12 @@
 //! Generic repositories configuration (D002 / VAL-SGIT-REPOCONFIG-008).
 //!
-//! Discovery precedence (first hit wins):
-//! 1. `SGIT_CONFIG` — absolute or relative path to a YAML file
-//! 2. XDG — `$XDG_CONFIG_HOME/sgit/config.yaml` (default `~/.config/sgit/config.yaml`)
-//!    when that file exists
-//! 3. Continuity fallback — `~/.stokd/config.yaml` `git:` / `repositories:` block
+//! Discovery precedence (first existing file wins) — AX-CORE-CONFIG-DISCOVERY-ORDER:
+//! 1. `SGIT_CONFIG` — absolute or relative path to a YAML file (wins even when missing)
+//! 2. Continuity — `~/.stokd/config.yaml` `git:` / `repositories:` block
+//! 3. sgit's default home — `~/.sgit/config.yaml`
+//! 4. XDG — `$XDG_CONFIG_HOME/sgit/config.yaml` (default `~/.config/sgit/config.yaml`)
 //!
-//! There is no code dependency on stokd; the fallback is only a filesystem path.
+//! There is no code dependency on stokd; the continuity path is only a filesystem path.
 //! Target keys are `git.bareRoot` / `git.root` / `git.worktree.primaryDirName`
 //! (VAL-GIT-002); legacy `repositories.*` remains dual-read for unmigrated files.
 
@@ -64,6 +64,8 @@ pub enum ConfigSource {
     Xdg(PathBuf),
     /// Continuity path `~/.stokd/config.yaml`.
     StokdContinuity(PathBuf),
+    /// sgit's own default config home (`~/.sgit/config.yaml`).
+    SgitHome(PathBuf),
     /// No config file found; compiled defaults.
     Defaults,
 }
@@ -72,8 +74,9 @@ impl ConfigSource {
     pub fn path(&self) -> Option<&Path> {
         match self {
             ConfigSource::SgitConfigEnv(p)
-            | ConfigSource::Xdg(p)
-            | ConfigSource::StokdContinuity(p) => Some(p.as_path()),
+            | ConfigSource::StokdContinuity(p)
+            | ConfigSource::SgitHome(p)
+            | ConfigSource::Xdg(p) => Some(p.as_path()),
             ConfigSource::Defaults => None,
         }
     }
@@ -109,50 +112,72 @@ struct ConfigDocument {
     git: Option<GitBlock>,
 }
 
-/// Resolve the config file path according to D002 precedence.
+/// Resolve the config file path according to
+/// [`AX-CORE-CONFIG-DISCOVERY-ORDER`](../../../.axioms.md) precedence.
 ///
-/// Returns `None` only when neither an override path nor the continuity file
-/// can be located (caller may still use [`RepositoriesConfig::default`]).
+/// Returns `None` only when no override is set and none of the discoverable
+/// files exist (caller may still use [`RepositoriesConfig::default`]).
 pub fn resolve_config_path() -> (Option<PathBuf>, ConfigSource) {
+    let sgit_config = env::var("SGIT_CONFIG").ok();
+    let home = dirs::home_dir();
+    let xdg = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    resolve_config_path_from(sgit_config.as_deref(), home.as_deref(), xdg.as_deref())
+}
+
+/// Pure precedence resolution — the single place the order is defined.
+///
+/// `sgit_config_env` is the raw `SGIT_CONFIG` value (blank/whitespace is
+/// ignored), `home` the user's home directory, `xdg_config_home` the
+/// `XDG_CONFIG_HOME` root (defaults to `<home>/.config` when absent).
+fn resolve_config_path_from(
+    sgit_config_env: Option<&str>,
+    home: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+) -> (Option<PathBuf>, ConfigSource) {
     // 1. SGIT_CONFIG — explicit override (even if the file is missing; load will error).
-    if let Ok(raw) = env::var("SGIT_CONFIG") {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            let path = PathBuf::from(trimmed);
-            return (Some(path.clone()), ConfigSource::SgitConfigEnv(path));
-        }
+    if let Some(trimmed) = sgit_config_env.map(str::trim).filter(|s| !s.is_empty()) {
+        let path = PathBuf::from(trimmed);
+        return (Some(path.clone()), ConfigSource::SgitConfigEnv(path));
     }
 
-    // 2. XDG — only when the file exists (absent override → fall through).
-    if let Some(xdg_file) = xdg_sgit_config_path() {
-        if xdg_file.is_file() {
-            return (Some(xdg_file.clone()), ConfigSource::Xdg(xdg_file));
-        }
-    }
-
-    // 3. Continuity — ~/.stokd/config.yaml when present.
-    if let Some(home) = dirs::home_dir() {
+    // 2. Continuity — ~/.stokd/config.yaml outranks sgit's own locations so a
+    //    machine already configured by stokd keeps working unchanged.
+    if let Some(home) = home {
         let stokd = home.join(".stokd").join("config.yaml");
         if stokd.is_file() {
             return (Some(stokd.clone()), ConfigSource::StokdContinuity(stokd));
+        }
+
+        // 3. sgit's own default home — ~/.sgit/config.yaml.
+        let sgit = home.join(".sgit").join("config.yaml");
+        if sgit.is_file() {
+            return (Some(sgit.clone()), ConfigSource::SgitHome(sgit));
+        }
+    }
+
+    // 4. XDG — last resort, so a stale ~/.config/sgit/config.yaml never
+    //    silently overrides the operator's real config.
+    if let Some(xdg_file) = xdg_sgit_config_path(home, xdg_config_home) {
+        if xdg_file.is_file() {
+            return (Some(xdg_file.clone()), ConfigSource::Xdg(xdg_file));
         }
     }
 
     (None, ConfigSource::Defaults)
 }
 
-/// `$XDG_CONFIG_HOME/sgit/config.yaml`, defaulting `XDG_CONFIG_HOME` to `~/.config`.
-fn xdg_sgit_config_path() -> Option<PathBuf> {
-    let base = env::var_os("XDG_CONFIG_HOME")
+/// `$XDG_CONFIG_HOME/sgit/config.yaml`, defaulting `XDG_CONFIG_HOME` to `<home>/.config`.
+fn xdg_sgit_config_path(home: Option<&Path>, xdg_config_home: Option<&Path>) -> Option<PathBuf> {
+    let base = xdg_config_home
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))?;
+        .or_else(|| home.map(|h| h.join(".config")))?;
     Some(base.join("sgit").join("config.yaml"))
 }
 
 /// Load [`RepositoriesConfig`] using D002 discovery.
 ///
-/// On a missing file when `SGIT_CONFIG` is set, returns an error. When no file
-/// is found via XDG or continuity, returns compiled defaults.
+/// On a missing file when `SGIT_CONFIG` is set, returns an error. When none of
+/// the discoverable files exist, returns compiled defaults.
 pub fn load_repositories_config() -> Result<(RepositoriesConfig, ConfigSource), String> {
     let (path, source) = resolve_config_path();
     match path {
@@ -217,6 +242,120 @@ fn merge_git_and_repositories(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a fake `$HOME` with any subset of the discoverable config files
+    /// present, plus a separate `XDG_CONFIG_HOME` root.
+    struct FakeHome {
+        _dir: tempfile::TempDir,
+        home: PathBuf,
+        xdg: PathBuf,
+    }
+
+    impl FakeHome {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("home");
+            let xdg = dir.path().join("xdg");
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&xdg).unwrap();
+            Self {
+                _dir: dir,
+                home,
+                xdg,
+            }
+        }
+
+        fn write(&self, rel: &str) -> PathBuf {
+            let path = if let Some(sub) = rel.strip_prefix("xdg/") {
+                self.xdg.join(sub)
+            } else {
+                self.home.join(rel)
+            };
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "git:\n  bareRoot: /b\n  root: /w\n").unwrap();
+            path
+        }
+
+        fn resolve(&self, sgit_config_env: Option<&str>) -> (Option<PathBuf>, ConfigSource) {
+            resolve_config_path_from(sgit_config_env, Some(self.home.as_path()), Some(self.xdg.as_path()))
+        }
+    }
+
+    #[test]
+    fn stokd_continuity_wins_over_sgit_home_and_xdg() {
+        let h = FakeHome::new();
+        let stokd = h.write(".stokd/config.yaml");
+        h.write(".sgit/config.yaml");
+        h.write("xdg/sgit/config.yaml");
+
+        let (path, source) = h.resolve(None);
+        assert_eq!(path.as_deref(), Some(stokd.as_path()));
+        assert_eq!(source, ConfigSource::StokdContinuity(stokd));
+    }
+
+    #[test]
+    fn sgit_home_wins_over_xdg_when_stokd_absent() {
+        let h = FakeHome::new();
+        let sgit = h.write(".sgit/config.yaml");
+        h.write("xdg/sgit/config.yaml");
+
+        let (path, source) = h.resolve(None);
+        assert_eq!(path.as_deref(), Some(sgit.as_path()));
+        assert_eq!(source, ConfigSource::SgitHome(sgit));
+    }
+
+    #[test]
+    fn xdg_is_last_resort() {
+        let h = FakeHome::new();
+        let xdg = h.write("xdg/sgit/config.yaml");
+
+        let (path, source) = h.resolve(None);
+        assert_eq!(path.as_deref(), Some(xdg.as_path()));
+        assert_eq!(source, ConfigSource::Xdg(xdg));
+    }
+
+    #[test]
+    fn no_files_yields_compiled_defaults() {
+        let h = FakeHome::new();
+        let (path, source) = h.resolve(None);
+        assert_eq!(path, None);
+        assert_eq!(source, ConfigSource::Defaults);
+    }
+
+    #[test]
+    fn sgit_config_env_wins_even_when_missing() {
+        let h = FakeHome::new();
+        h.write(".stokd/config.yaml");
+        h.write(".sgit/config.yaml");
+        h.write("xdg/sgit/config.yaml");
+
+        let (path, source) = h.resolve(Some("/nowhere/override.yaml"));
+        assert_eq!(path.as_deref(), Some(Path::new("/nowhere/override.yaml")));
+        assert_eq!(
+            source,
+            ConfigSource::SgitConfigEnv(PathBuf::from("/nowhere/override.yaml"))
+        );
+    }
+
+    #[test]
+    fn blank_sgit_config_env_falls_through_to_file_discovery() {
+        let h = FakeHome::new();
+        let sgit = h.write(".sgit/config.yaml");
+
+        let (path, source) = h.resolve(Some("  "));
+        assert_eq!(path.as_deref(), Some(sgit.as_path()));
+        assert_eq!(source, ConfigSource::SgitHome(sgit));
+    }
+
+    #[test]
+    fn xdg_falls_back_to_home_dot_config_when_unset() {
+        let h = FakeHome::new();
+        let xdg = h.write(".config/sgit/config.yaml");
+
+        let (path, source) = resolve_config_path_from(None, Some(h.home.as_path()), None);
+        assert_eq!(path.as_deref(), Some(xdg.as_path()));
+        assert_eq!(source, ConfigSource::Xdg(xdg));
+    }
 
     #[test]
     fn parses_stokd_shaped_document() {
