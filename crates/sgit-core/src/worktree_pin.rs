@@ -205,7 +205,7 @@ pub fn discover_bare_repos(bare_root: &Path) -> Vec<PathBuf> {
 
 /// Default hooks version embedded in the pin's reference-transaction script when
 /// installed by sgit (independent of stokd's full hook set version).
-pub const PIN_HOOKS_VERSION: u32 = 7;
+pub const PIN_HOOKS_VERSION: u32 = 8;
 
 /// Subdirectory under the common git dir for sgit-managed pin hooks when no
 /// existing `core.hooksPath` is configured.
@@ -377,6 +377,12 @@ fn collect_bare(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
 ///   * only *this* worktree's own HEAD counts, detected via `$gd/HEAD.lock`, so
 ///     creating a sibling worktree with `git worktree add` is never refused
 ///     (AX-SGIT-PIN-HEAD-LOCK-SCOPES-ENFORCEMENT)
+///
+/// A refusal is *atomic*: git rewrites the index and working tree before it opens
+/// the HEAD ref transaction, so blocking at `prepared` alone leaves the other
+/// branch's files checked out under an unmoved HEAD. The refusal therefore drops
+/// a `<marker>.refused` sentinel and the `aborted` phase restores the tree with
+/// `git read-tree -m -u HEAD`. (AX-SGIT-PIN-REFUSAL-IS-ATOMIC)
 pub fn reference_transaction_script(hooks_version: u32) -> String {
     format!(
         r#"#!/bin/sh
@@ -414,11 +420,35 @@ input="$(cat)"
         esac
       done
       if [ $? -eq 39 ]; then
+        # Git updates the index and working tree BEFORE it opens the HEAD ref
+        # transaction, so refusing here leaves the *other* branch's files on disk
+        # under an unmoved HEAD. Mark the refusal so the `aborted` phase below can
+        # put the tree back. (AX-SGIT-PIN-REFUSAL-IS-ATOMIC)
+        : > "$gd/{marker}.refused" 2>/dev/null || true
         echo "stokd: refusing to move this worktree off '$pinned'." >&2
         echo "stokd: a worktree directory must match its branch. NEVER repoint a worktree folder at a different branch." >&2
         echo "stokd: to work on another branch, run: sgit checkout <branch>" >&2
         exit 1
       fi
+    fi
+  fi
+fi
+if [ "$state" = "aborted" ]; then
+  gd="${{GIT_DIR:-}}"
+  [ -z "$gd" ] && gd="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+  # Sentinel-gated: only a refusal *we* issued repairs the tree, so unrelated
+  # aborted ref transactions never touch the working tree.
+  # (AX-SGIT-PIN-REFUSAL-IS-ATOMIC)
+  if [ -n "$gd" ] && [ -f "$gd/{marker}.refused" ]; then
+    rm -f "$gd/{marker}.refused"
+    # `read-tree -m -u HEAD` restores index + working tree to HEAD while carrying
+    # local modifications across. Never `reset --hard`, never `clean` — a refused
+    # switch must not be able to destroy uncommitted work.
+    if git read-tree -m -u HEAD 2>/dev/null; then
+      echo "stokd: working tree restored to the pinned branch; nothing was switched." >&2
+    else
+      echo "stokd: WARNING — the refused switch left this worktree's files off HEAD." >&2
+      echo "stokd: restore them with: git read-tree -m -u HEAD" >&2
     fi
   fi
 fi
@@ -470,6 +500,17 @@ mod tests {
             out.status.success(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
+    }
+
+    /// Trimmed stdout of `git -C dir <args>` (empty when the command fails).
+    fn git_stdout(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// The branch `dir`'s HEAD points at, or `"<detached>"`.
@@ -770,6 +811,92 @@ mod tests {
             "refusal must name the offending worktree's own pin, got: {stderr}"
         );
         assert_eq!(head_symref(&second), "refs/heads/second");
+    }
+
+    /// A refused switch must leave the worktree byte-identical to its pre-switch
+    /// state — not merely leave HEAD unmoved. Git rewrites the index and working
+    /// tree *before* it opens the HEAD ref transaction, so a `prepared`-phase
+    /// refusal alone leaves the other branch's files on disk under an unmoved
+    /// HEAD; an `add -A` auto-commit would then land that whole tree on the pinned
+    /// branch. (AX-SGIT-PIN-REFUSAL-IS-ATOMIC)
+    #[test]
+    fn refused_switch_leaves_the_worktree_untouched() {
+        let (_tmp, primary, wt) = armed_scratch_repo();
+        // A file that exists only on the pinned branch...
+        std::fs::write(wt.join("only-on-pinned.txt"), "pinned\n").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-q", "-m", "pinned file"]);
+        // ...and one that exists only on the branch we will try to switch to.
+        git(&primary, &["checkout", "-q", "-b", "other"]);
+        std::fs::write(primary.join("only-on-other.txt"), "other\n").unwrap();
+        git(&primary, &["add", "-A"]);
+        git(&primary, &["commit", "-q", "-m", "other file"]);
+        git(&primary, &["checkout", "-q", "main"]);
+
+        let (ok, stderr) = git_try(&wt, &["checkout", "-q", "other"]);
+        assert!(!ok, "a pinned worktree must refuse a branch switch");
+        assert_eq!(
+            head_symref(&wt),
+            "refs/heads/pinned",
+            "HEAD must be unchanged after a refused switch"
+        );
+        assert!(
+            wt.join("only-on-pinned.txt").exists(),
+            "the pinned branch's file must survive the refused switch: {stderr}"
+        );
+        assert!(
+            !wt.join("only-on-other.txt").exists(),
+            "the other branch's file must not be left behind by a refused switch: {stderr}"
+        );
+        let status = git_stdout(&wt, &["status", "--porcelain"]);
+        assert!(
+            status.is_empty(),
+            "a refused switch must leave a clean worktree, got:\n{status}\nstderr: {stderr}"
+        );
+    }
+
+    /// The repair restores the tree without destroying uncommitted work: a local
+    /// modification git carried across the attempted switch is still there
+    /// afterward. (AX-SGIT-PIN-REFUSAL-IS-ATOMIC)
+    #[test]
+    fn refused_switch_preserves_local_modifications() {
+        let (_tmp, primary, wt) = armed_scratch_repo();
+        std::fs::write(wt.join("shared.txt"), "base\n").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-q", "-m", "shared"]);
+        git(&primary, &["branch", "other", "pinned"]);
+
+        std::fs::write(wt.join("shared.txt"), "my local edit\n").unwrap();
+        let (ok, _stderr) = git_try(&wt, &["checkout", "-q", "other"]);
+        assert!(!ok, "a pinned worktree must refuse a branch switch");
+        assert_eq!(head_symref(&wt), "refs/heads/pinned");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("shared.txt")).unwrap(),
+            "my local edit\n",
+            "the repair must not destroy uncommitted work"
+        );
+    }
+
+    /// The repair is sentinel-gated: an aborted ref transaction the pin did NOT
+    /// refuse must never touch the working tree.
+    /// (AX-SGIT-PIN-REFUSAL-IS-ATOMIC)
+    #[test]
+    fn unrelated_aborted_transaction_does_not_touch_the_worktree() {
+        let (_tmp, _primary, wt) = armed_scratch_repo();
+        let gd = worktree_git_dir(&wt).unwrap();
+        assert!(
+            !gd.join(format!("{PIN_MARKER_FILE}.refused")).exists(),
+            "no refusal sentinel should exist before a refusal"
+        );
+        // An uncommitted edit stands in for "work the repair must not sweep".
+        std::fs::write(wt.join("scratch.txt"), "untracked\n").unwrap();
+        // A failed branch creation aborts a ref transaction the pin never refused.
+        let (ok, _e) = git_try(&wt, &["branch", "pinned"]);
+        assert!(!ok, "creating an existing branch must fail");
+        assert!(
+            wt.join("scratch.txt").exists(),
+            "an unrelated aborted transaction must not touch the working tree"
+        );
     }
 
     /// Detaching HEAD stays allowed — rebase and bisect depend on it, and the
