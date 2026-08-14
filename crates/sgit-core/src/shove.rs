@@ -5,8 +5,9 @@
 //! policy (agent dispatch in stokd, shell/`$EDITOR` in sgit).
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── ConflictResolver seam ────────────────────────────────────────────────────
@@ -109,10 +110,7 @@ pub fn shove(
     // --- Commit phase ---------------------------------------------------------
     let status = git_status_porcelain(repo_root)?;
     if !status.is_empty() {
-        let artifact_patterns = detect_artifact_patterns(&status);
-        if !artifact_patterns.is_empty() {
-            update_gitignore(repo_root, &artifact_patterns)?;
-        }
+        prepare_artifact_exclusions(repo_root)?;
 
         println!("[{}] Staging all changes...", repo_root.display());
         run_git(repo_root, &["add", "-A"])?;
@@ -805,105 +803,552 @@ fn fallback_commit_message(staged_stat: &str) -> String {
 
 // ── Artifact / gitignore helpers ─────────────────────────────────────────────
 
-/// Returns the set of `.gitignore` patterns that should be added for untracked
-/// files/dirs that look like build artifacts or generated dev output.
+const ARTIFACT_DIRS: &[(&str, &str)] = &[
+    // Slash-less by design: worktree dependency installers may create a
+    // node_modules symlink, and `node_modules/` would match directories only.
+    ("node_modules", "node_modules"),
+    ("dist", "dist/"),
+    ("build", "build/"),
+    ("out", "out/"),
+    (".next", ".next/"),
+    (".nuxt", ".nuxt/"),
+    (".output", ".output/"),
+    ("__pycache__", "__pycache__/"),
+    (".pytest_cache", ".pytest_cache/"),
+    (".mypy_cache", ".mypy_cache/"),
+    (".ruff_cache", ".ruff_cache/"),
+    ("coverage", "coverage/"),
+    (".nyc_output", ".nyc_output/"),
+    (".turbo", ".turbo/"),
+    (".cache", ".cache/"),
+    (".parcel-cache", ".parcel-cache/"),
+    (".expo", ".expo/"),
+    (".serverless", ".serverless/"),
+    ("cdk.out", "cdk.out/"),
+    (".terraform", ".terraform/"),
+    (".gradle", ".gradle/"),
+    (".idea", ".idea/"),
+    ("target", "target/"),
+    (".docusaurus", ".docusaurus/"),
+    (".storybook-out", ".storybook-out/"),
+    ("storybook-static", "storybook-static/"),
+    (".astro", ".astro/"),
+    (".svelte-kit", ".svelte-kit/"),
+    ("playwright-report", "playwright-report/"),
+    ("test-results", "test-results/"),
+];
+
+// These names are ecosystem-specific enough to classify below the repository
+// root. Ambiguous names such as build/dist/out remain top-level-only so a
+// legitimate source path like src/build/main.rs is never hidden.
+const NESTED_ARTIFACT_DIRS: &[&str] = &[
+    "node_modules",
+    ".next",
+    ".nuxt",
+    ".output",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".nyc_output",
+    ".turbo",
+    ".parcel-cache",
+    ".expo",
+    ".serverless",
+    "cdk.out",
+    ".terraform",
+    ".gradle",
+    ".idea",
+    ".docusaurus",
+    ".storybook-out",
+    "storybook-static",
+    ".astro",
+    ".svelte-kit",
+    "playwright-report",
+    "test-results",
+];
+
+const ARTIFACT_EXTENSIONS: &[(&str, &str)] = &[
+    (".pyc", "*.pyc"),
+    (".pyo", "*.pyo"),
+    (".class", "*.class"),
+    (".o", "*.o"),
+    (".a", "*.a"),
+    (".so", "*.so"),
+    (".dylib", "*.dylib"),
+    (".dll", "*.dll"),
+    (".exe", "*.exe"),
+    (".pdb", "*.pdb"),
+    (".pid", "*.pid"),
+];
+
+const ARTIFACT_FILES: &[&str] = &[
+    ".DS_Store",
+    "Thumbs.db",
+    "ehthumbs.db",
+    "Desktop.ini",
+    ".env.local",
+    ".env.development.local",
+    ".env.test.local",
+    ".env.production.local",
+];
+
+/// Result of the pre-stage artifact pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArtifactExclusion {
+    /// Ignore patterns discovered from individual candidate paths.
+    pub patterns: Vec<String>,
+    /// Previously staged additions removed from the index (working files stay).
+    pub unstaged_paths: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct ArtifactClassification {
+    patterns: Vec<String>,
+    paths: HashSet<String>,
+}
+
+/// Inventory untracked leaf files and already-staged additions, install ignore
+/// patterns, and remove generated additions from the index without deleting
+/// their working-tree files. Call this before any blanket `git add -A`.
+pub fn prepare_artifact_exclusions(repo_root: &Path) -> Result<ArtifactExclusion, String> {
+    // `git status --porcelain` normally collapses an untracked tree to its
+    // highest directory. `ls-files --others` gives the leaf paths needed to
+    // recognize nested build output such as project/bin/Debug/net10.0/*.dll.
+    let untracked = git_nul_paths(
+        repo_root,
+        &["ls-files", "--others", "--exclude-standard", "-z", "--"],
+    )?;
+    // A retry after an interrupted shove sees those same files as staged `A`,
+    // not untracked. Inspect the index explicitly so ignores can take effect.
+    let staged_additions = git_nul_paths(
+        repo_root,
+        &[
+            "diff",
+            "--cached",
+            "--name-only",
+            "--diff-filter=A",
+            "-z",
+            "--",
+        ],
+    )?;
+
+    let mut candidates = untracked;
+    candidates.extend(staged_additions.iter().cloned());
+    candidates.sort();
+    candidates.dedup();
+
+    let classified = classify_artifact_paths(&candidates);
+    if classified.patterns.is_empty() {
+        return Ok(ArtifactExclusion::default());
+    }
+
+    let staged_artifacts: Vec<String> = staged_additions
+        .into_iter()
+        .filter(|path| classified.paths.contains(path))
+        .collect();
+    ensure_worktree_copies(repo_root, &staged_artifacts)?;
+    validate_gitignore_patterns(&classified.patterns)?;
+
+    let gitignore_before = read_gitignore_bytes(repo_root)?;
+    update_gitignore(repo_root, &classified.patterns)?;
+    if let Err(error) = ensure_artifacts_are_ignored(repo_root, &classified.paths) {
+        restore_gitignore(repo_root, gitignore_before)?;
+        return Err(error);
+    }
+
+    if !staged_artifacts.is_empty() {
+        remove_index_paths(repo_root, &staged_artifacts)?;
+        println!(
+            "[gitignore] Removed {} staged artifact file(s) from the index; working files were preserved.",
+            staged_artifacts.len()
+        );
+    }
+
+    Ok(ArtifactExclusion {
+        patterns: classified.patterns,
+        unstaged_paths: staged_artifacts,
+    })
+}
+
+/// Returns the set of `.gitignore` patterns for untracked or index-added
+/// porcelain entries. Kept as a pure compatibility helper for land/task paths;
+/// shove itself uses [`prepare_artifact_exclusions`] so it sees leaf paths and
+/// can repair an interrupted staging pass.
 pub fn detect_artifact_patterns(status: &str) -> Vec<String> {
-    const ARTIFACT_DIRS: &[(&str, &str)] = &[
-        ("node_modules", "node_modules/"),
-        ("dist", "dist/"),
-        ("build", "build/"),
-        ("out", "out/"),
-        (".next", ".next/"),
-        (".nuxt", ".nuxt/"),
-        (".output", ".output/"),
-        ("__pycache__", "__pycache__/"),
-        (".pytest_cache", ".pytest_cache/"),
-        (".mypy_cache", ".mypy_cache/"),
-        (".ruff_cache", ".ruff_cache/"),
-        ("coverage", "coverage/"),
-        (".nyc_output", ".nyc_output/"),
-        (".turbo", ".turbo/"),
-        (".cache", ".cache/"),
-        (".parcel-cache", ".parcel-cache/"),
-        (".expo", ".expo/"),
-        (".serverless", ".serverless/"),
-        ("cdk.out", "cdk.out/"),
-        (".terraform", ".terraform/"),
-        (".gradle", ".gradle/"),
-        (".idea", ".idea/"),
-        ("target", "target/"),
-        (".docusaurus", ".docusaurus/"),
-        (".storybook-out", ".storybook-out/"),
-        ("storybook-static", "storybook-static/"),
-        (".astro", ".astro/"),
-        (".svelte-kit", ".svelte-kit/"),
-        ("playwright-report", "playwright-report/"),
-        ("test-results", "test-results/"),
-    ];
-
-    const ARTIFACT_EXTENSIONS: &[(&str, &str)] = &[
-        (".pyc", "*.pyc"),
-        (".pyo", "*.pyo"),
-        (".class", "*.class"),
-        (".o", "*.o"),
-        (".a", "*.a"),
-        (".so", "*.so"),
-        (".dylib", "*.dylib"),
-        (".dll", "*.dll"),
-        (".exe", "*.exe"),
-        (".pid", "*.pid"),
-    ];
-
-    const ARTIFACT_FILES: &[&str] = &[
-        ".DS_Store",
-        "Thumbs.db",
-        "ehthumbs.db",
-        "Desktop.ini",
-        ".env.local",
-        ".env.development.local",
-        ".env.test.local",
-        ".env.production.local",
-    ];
-
-    let mut patterns: HashSet<String> = HashSet::new();
-
-    for line in status.lines() {
-        if !line.starts_with("??") {
-            continue;
-        }
-        let path = line[3..].trim().trim_matches('"');
-        let first = path.split('/').next().unwrap_or(path);
-        let first_lower = first.to_lowercase();
-
-        for (dir, pattern) in ARTIFACT_DIRS {
-            if first_lower == *dir {
-                patterns.insert(pattern.to_string());
-                break;
+    let paths: Vec<String> = status
+        .lines()
+        .filter_map(|line| {
+            let bytes = line.as_bytes();
+            if bytes.len() < 4 || !(line.starts_with("??") || bytes[0] == b'A') {
+                return None;
             }
+            Some(line[3..].trim().trim_matches('"').to_string())
+        })
+        .collect();
+    classify_artifact_paths(&paths).patterns
+}
+
+fn classify_artifact_paths(paths: &[String]) -> ArtifactClassification {
+    let mut patterns = HashSet::new();
+    for path in paths {
+        if let Some(pattern) = artifact_pattern_for_path(path) {
+            patterns.insert(pattern);
         }
+    }
 
-        if !path.ends_with('/') {
-            let path_lower = path.to_lowercase();
-            for (ext, pattern) in ARTIFACT_EXTENSIONS {
-                if path_lower.ends_with(ext) {
-                    patterns.insert(pattern.to_string());
-                    break;
-                }
+    let mut sorted_patterns: Vec<String> = patterns.into_iter().collect();
+    sorted_patterns.sort();
+    let artifact_paths = paths
+        .iter()
+        .filter(|path| {
+            sorted_patterns
+                .iter()
+                .any(|pattern| artifact_pattern_matches_path(pattern, path))
+        })
+        .cloned()
+        .collect();
+
+    ArtifactClassification {
+        patterns: sorted_patterns,
+        paths: artifact_paths,
+    }
+}
+
+fn artifact_pattern_for_path(path: &str) -> Option<String> {
+    let normalized = path.trim_end_matches('/');
+    let components: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if components.is_empty() {
+        return None;
+    }
+
+    for (index, component) in components.iter().enumerate() {
+        let lower = component.to_ascii_lowercase();
+        if let Some((_, pattern)) = ARTIFACT_DIRS.iter().find(|(dir, _)| lower == *dir) {
+            if *pattern == "node_modules" {
+                return Some((*pattern).to_string());
             }
-
-            let filename = path.split('/').next_back().unwrap_or(path);
-            for &exact in ARTIFACT_FILES {
-                if filename == exact {
-                    patterns.insert(exact.to_string());
-                    break;
-                }
+            let is_directory = index + 1 < components.len() || path.ends_with('/');
+            let nested_is_recognized = index == 0 || NESTED_ARTIFACT_DIRS.contains(&lower.as_str());
+            if is_directory && nested_is_recognized {
+                return Some(if index == 0 {
+                    format!("/{}/", pattern.trim_end_matches('/'))
+                } else {
+                    scoped_directory_pattern(&components, index)
+                });
             }
         }
     }
 
-    let mut sorted: Vec<String> = patterns.into_iter().collect();
-    sorted.sort();
-    sorted
+    // `obj` is unambiguously generated in .NET projects. Anchor the ignore to
+    // the observed project path instead of adding a repo-wide `obj/` rule.
+    if let Some(index) = components
+        .iter()
+        .position(|component| component.eq_ignore_ascii_case("obj"))
+    {
+        if index + 1 < components.len() || path.ends_with('/') {
+            return Some(scoped_directory_pattern(&components, index));
+        }
+    }
+
+    // `bin` is a common source-script directory, so only classify it when the
+    // observed leaf path carries a .NET build signal. Once one signal discovers
+    // the scoped bin root, the second classification pass covers every sibling.
+    if let Some(index) = components
+        .iter()
+        .position(|component| component.eq_ignore_ascii_case("bin"))
+    {
+        let suffix = &components[index + 1..];
+        if suffix.iter().any(|component| dotnet_path_signal(component)) {
+            return Some(scoped_directory_pattern(&components, index));
+        }
+    }
+
+    let path_lower = normalized.to_ascii_lowercase();
+    if let Some((_, pattern)) = ARTIFACT_EXTENSIONS
+        .iter()
+        .find(|(extension, _)| path_lower.ends_with(*extension))
+    {
+        return Some((*pattern).to_string());
+    }
+
+    let filename = components.last().copied().unwrap_or(normalized);
+    ARTIFACT_FILES
+        .iter()
+        .find(|exact| filename == **exact)
+        .map(|exact| (*exact).to_string())
+}
+
+fn scoped_directory_pattern(components: &[&str], index: usize) -> String {
+    let escaped = components[..=index]
+        .iter()
+        .map(|component| escape_gitignore_component(component))
+        .collect::<Vec<_>>()
+        .join("/");
+    if index == 0 {
+        format!("/{escaped}/")
+    } else {
+        format!("{escaped}/")
+    }
+}
+
+fn escape_gitignore_component(component: &str) -> String {
+    let mut escaped = String::with_capacity(component.len());
+    for character in component.chars() {
+        if matches!(character, '\\' | '*' | '?' | '[' | ']' | '!' | '#' | ' ') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+fn unescape_gitignore_literal(pattern: &str) -> String {
+    let mut literal = String::with_capacity(pattern.len());
+    let mut characters = pattern.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            if let Some(escaped) = characters.next() {
+                literal.push(escaped);
+            } else {
+                literal.push(character);
+            }
+        } else {
+            literal.push(character);
+        }
+    }
+    literal
+}
+
+fn dotnet_path_signal(component: &str) -> bool {
+    let lower = component.to_ascii_lowercase();
+    lower.ends_with(".dll")
+        || lower.ends_with(".exe")
+        || lower.ends_with(".pdb")
+        || lower.ends_with(".deps.json")
+        || lower.ends_with(".runtimeconfig.json")
+}
+
+fn artifact_pattern_matches_path(pattern: &str, path: &str) -> bool {
+    let normalized = path.trim_end_matches('/');
+    let lower = normalized.to_ascii_lowercase();
+    if let Some(extension) = pattern.strip_prefix('*') {
+        return lower.ends_with(&extension.to_ascii_lowercase());
+    }
+    if pattern.ends_with('/') {
+        let directory = unescape_gitignore_literal(pattern.trim_end_matches('/'));
+        if let Some(root_directory) = directory.strip_prefix('/') {
+            return normalized == root_directory
+                || normalized.starts_with(&format!("{root_directory}/"));
+        }
+        if directory.contains('/') {
+            return normalized == directory || normalized.starts_with(&format!("{directory}/"));
+        }
+        return normalized
+            .split('/')
+            .any(|component| component.eq_ignore_ascii_case(&directory));
+    }
+    if pattern == "node_modules" {
+        return normalized
+            .split('/')
+            .any(|component| component.eq_ignore_ascii_case(pattern));
+    }
+    normalized
+        .split('/')
+        .next_back()
+        .is_some_and(|filename| filename == pattern)
+}
+
+fn git_nul_paths(repo_root: &Path, args: &[&str]) -> Result<Vec<String>, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()
+        .map_err(|error| format!("git {} failed: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            String::from_utf8(path.to_vec())
+                .map_err(|_| "shove cannot safely classify a non-UTF-8 Git path".to_string())
+        })
+        .collect()
+}
+
+fn ensure_worktree_copies(repo_root: &Path, paths: &[String]) -> Result<(), String> {
+    let missing: Vec<&str> = paths
+        .iter()
+        .filter_map(|path| {
+            std::fs::symlink_metadata(repo_root.join(path))
+                .is_err()
+                .then_some(path.as_str())
+        })
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to unstage artifact additions with no working-tree copy: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+fn validate_gitignore_patterns(patterns: &[String]) -> Result<(), String> {
+    if let Some(pattern) = patterns
+        .iter()
+        .find(|pattern| pattern.contains('\n') || pattern.contains('\r'))
+    {
+        Err(format!(
+            "refusing to write a .gitignore pattern containing a line break: {pattern:?}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn read_gitignore_bytes(repo_root: &Path) -> Result<Option<Vec<u8>>, String> {
+    let path = repo_root.join(".gitignore");
+    match std::fs::read(&path) {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Failed to snapshot .gitignore: {error}")),
+    }
+}
+
+fn restore_gitignore(repo_root: &Path, previous: Option<Vec<u8>>) -> Result<(), String> {
+    let path = repo_root.join(".gitignore");
+    match previous {
+        Some(content) => {
+            if std::fs::read(&path).ok().as_deref() != Some(content.as_slice()) {
+                std::fs::write(&path, content)
+                    .map_err(|error| format!("failed to restore .gitignore: {error}"))?;
+            }
+        }
+        None if path.exists() => {
+            std::fs::remove_file(&path)
+                .map_err(|error| format!("failed to remove generated .gitignore: {error}"))?;
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn ensure_artifacts_are_ignored(
+    repo_root: &Path,
+    artifact_paths: &HashSet<String>,
+) -> Result<(), String> {
+    if artifact_paths.is_empty() {
+        return Ok(());
+    }
+
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["check-ignore", "--no-index", "-z", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to verify artifact ignore rules: {error}"))?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "failed to open git check-ignore stdin".to_string())?;
+        for path in artifact_paths {
+            stdin
+                .write_all(path.as_bytes())
+                .and_then(|_| stdin.write_all(&[0]))
+                .map_err(|error| format!("failed to verify artifact path: {error}"))?;
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed waiting for git check-ignore: {error}"))?;
+    // check-ignore uses 1 for "none matched", which is a valid verification
+    // result handled below. Any other non-zero code is an execution failure.
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(format!(
+            "failed to verify artifact ignore rules:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let ignored: HashSet<String> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            String::from_utf8(path.to_vec())
+                .map_err(|_| "git check-ignore returned a non-UTF-8 path".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let mut missing: Vec<&str> = artifact_paths
+        .iter()
+        .filter(|path| !ignored.contains(*path))
+        .map(String::as_str)
+        .collect();
+    missing.sort();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            ".gitignore did not exclude these detected artifacts; refusing blanket staging: {}",
+            missing.into_iter().take(10).collect::<Vec<_>>().join(", ")
+        ))
+    }
+}
+
+fn remove_index_paths(repo_root: &Path, paths: &[String]) -> Result<(), String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["update-index", "--force-remove", "-z", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to unstage artifact files: {error}"))?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "failed to open git update-index stdin".to_string())?;
+        for path in paths {
+            stdin
+                .write_all(path.as_bytes())
+                .and_then(|_| stdin.write_all(&[0]))
+                .map_err(|error| format!("failed to send artifact path to git: {error}"))?;
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed waiting for git update-index: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to unstage artifact files:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
 }
 
 pub fn update_gitignore(repo_root: &Path, new_patterns: &[String]) -> Result<(), String> {
@@ -1075,7 +1520,222 @@ mod tests {
     fn detect_artifacts_flags_known_dirs() {
         let status = "?? node_modules/foo\n?? dist/out.js\n M src/a.rs\n";
         let p = detect_artifact_patterns(status);
-        assert!(p.iter().any(|x| x == "node_modules/"));
-        assert!(p.iter().any(|x| x == "dist/"));
+        assert!(p.iter().any(|x| x == "node_modules"));
+        assert!(p.iter().any(|x| x == "/dist/"));
+    }
+
+    #[test]
+    fn detect_artifacts_finds_nested_dotnet_output_without_hiding_source_bin() {
+        let status = "\
+?? tools/dotnet/status-push/bin/Debug/net10.0/app.dll\n\
+?? tools/dotnet/status-push/bin/Debug/net10.0/app.deps.json\n\
+?? tools/dotnet/status-push/obj/Debug/net10.0/App.AssemblyInfo.cs\n\
+?? bin/Debug/net10.0/root-app.dll\n\
+?? obj/Debug/net10.0/Root.AssemblyInfo.cs\n\
+?? build/app.js\n\
+?? packages/web/build/assets/app.js\n\
+?? src/build/main.rs\n\
+?? bin/release/deploy.sh\n\
+?? bin/net8/deploy.sh\n\
+?? tools/bin/net8/deploy.sh\n\
+?? bin/release.sh\n";
+        let patterns = detect_artifact_patterns(status);
+        assert!(patterns.contains(&"tools/dotnet/status-push/bin/".to_string()));
+        assert!(patterns.contains(&"tools/dotnet/status-push/obj/".to_string()));
+        assert!(patterns.contains(&"/bin/".to_string()));
+        assert!(patterns.contains(&"/obj/".to_string()));
+        assert!(patterns.contains(&"/build/".to_string()));
+        assert!(!patterns.contains(&"packages/web/build/".to_string()));
+        assert!(!patterns.contains(&"src/build/".to_string()));
+        assert!(!patterns.contains(&"build/".to_string()));
+        assert!(!patterns.contains(&"bin/".to_string()));
+    }
+
+    #[test]
+    fn prepare_artifacts_repairs_interrupted_staging_and_preserves_worktree() {
+        let repo = tempfile::tempdir().expect("temp repo");
+        git_test(repo.path(), &["init"]);
+        git_test(repo.path(), &["config", "user.name", "Shove Test"]);
+        git_test(
+            repo.path(),
+            &["config", "user.email", "shove-test@example.com"],
+        );
+        write_test_file(repo.path(), "README.md", "base\n");
+        git_test(repo.path(), &["add", "README.md"]);
+        git_test(repo.path(), &["commit", "-m", "base"]);
+
+        let project = "tools/dotnet/Status [Push]";
+        let source = format!("{project}/Program.cs");
+        let dll = format!("{project}/bin/Debug/net10.0/app.dll");
+        let deps = format!("{project}/bin/Debug/net10.0/app.deps.json");
+        let generated = format!("{project}/obj/Debug/net10.0/App.AssemblyInfo.cs");
+        let root_dll = "bin/Debug/net10.0/root-app.dll";
+        let root_generated = "obj/Debug/net10.0/Root.AssemblyInfo.cs";
+        let root_build = "build/app.js";
+        let nested_bin_source = "tools/bin/net8/deploy.sh";
+        let nested_build_source = "src/build/main.rs";
+        write_test_file(repo.path(), &source, "class Program {}\n");
+        write_test_file(repo.path(), &dll, "binary\n");
+        write_test_file(repo.path(), &deps, "{}\n");
+        write_test_file(repo.path(), &generated, "// generated\n");
+        write_test_file(repo.path(), root_dll, "binary\n");
+        write_test_file(repo.path(), root_generated, "// generated\n");
+        write_test_file(repo.path(), root_build, "generated\n");
+        write_test_file(repo.path(), nested_bin_source, "#!/bin/sh\n");
+        write_test_file(repo.path(), nested_build_source, "fn build() {}\n");
+
+        // Simulate Ctrl-C after the old shove's blanket staging step.
+        git_test(repo.path(), &["add", "-A"]);
+        let outcome = prepare_artifact_exclusions(repo.path()).expect("prepare exclusions");
+        assert_eq!(
+            outcome.patterns,
+            vec![
+                "/bin/".to_string(),
+                "/build/".to_string(),
+                "/obj/".to_string(),
+                "tools/dotnet/Status\\ \\[Push\\]/bin/".to_string(),
+                "tools/dotnet/Status\\ \\[Push\\]/obj/".to_string(),
+            ]
+        );
+        assert!(outcome.unstaged_paths.contains(&dll));
+        assert!(outcome.unstaged_paths.contains(&deps));
+        assert!(outcome.unstaged_paths.contains(&generated));
+        assert!(outcome.unstaged_paths.iter().any(|path| path == root_dll));
+        assert!(outcome
+            .unstaged_paths
+            .iter()
+            .any(|path| path == root_generated));
+        assert!(outcome.unstaged_paths.iter().any(|path| path == root_build));
+        assert!(!outcome.unstaged_paths.contains(&source));
+        assert!(!outcome
+            .unstaged_paths
+            .iter()
+            .any(|path| path == nested_bin_source));
+        assert!(!outcome
+            .unstaged_paths
+            .iter()
+            .any(|path| path == nested_build_source));
+
+        // Source stays staged. Generated files leave the index but remain on
+        // disk, and a resumed blanket add cannot stage them again.
+        let staged_before = run_git_captured(
+            repo.path(),
+            &["diff", "--cached", "--name-only", "--diff-filter=A"],
+        )
+        .stdout;
+        assert!(staged_before.lines().any(|path| path == source));
+        assert!(staged_before.lines().any(|path| path == nested_bin_source));
+        assert!(staged_before
+            .lines()
+            .any(|path| path == nested_build_source));
+        assert!(!staged_before.lines().any(|path| path == dll));
+        assert!(!staged_before.lines().any(|path| path == root_dll));
+        assert!(!staged_before.lines().any(|path| path == root_build));
+        assert!(repo.path().join(&dll).is_file());
+        assert!(repo.path().join(&deps).is_file());
+        assert!(repo.path().join(&generated).is_file());
+        assert!(repo.path().join(root_dll).is_file());
+        assert!(repo.path().join(root_generated).is_file());
+        assert!(repo.path().join(root_build).is_file());
+
+        git_test(repo.path(), &["add", "-A"]);
+        let staged_after =
+            run_git_captured(repo.path(), &["diff", "--cached", "--name-only"]).stdout;
+        assert!(staged_after.lines().any(|path| path == ".gitignore"));
+        assert!(staged_after.lines().any(|path| path == source));
+        assert!(staged_after.lines().any(|path| path == nested_bin_source));
+        assert!(staged_after.lines().any(|path| path == nested_build_source));
+        assert!(!staged_after.lines().any(|path| path == dll));
+        assert!(!staged_after.lines().any(|path| path == deps));
+        assert!(!staged_after.lines().any(|path| path == generated));
+        assert!(!staged_after.lines().any(|path| path == root_dll));
+        assert!(!staged_after.lines().any(|path| path == root_generated));
+        assert!(!staged_after.lines().any(|path| path == root_build));
+        git_test(repo.path(), &["check-ignore", "-q", "--", &dll]);
+        git_test(repo.path(), &["check-ignore", "-q", "--", &generated]);
+        git_test(repo.path(), &["check-ignore", "-q", "--", root_dll]);
+        git_test(repo.path(), &["check-ignore", "-q", "--", root_generated]);
+        git_test(repo.path(), &["check-ignore", "-q", "--", root_build]);
+    }
+
+    #[test]
+    fn prepare_artifacts_refuses_to_drop_staged_only_content() {
+        let repo = initialized_test_repo();
+        let artifact = "project/obj/Debug/net10.0/generated.cs";
+        write_test_file(repo.path(), artifact, "// generated\n");
+        git_test(repo.path(), &["add", artifact]);
+        std::fs::remove_file(repo.path().join(artifact)).expect("remove working copy");
+
+        let error = prepare_artifact_exclusions(repo.path()).expect_err("must fail closed");
+        assert!(error.contains("no working-tree copy"), "{error}");
+        let staged = run_git_captured(repo.path(), &["diff", "--cached", "--name-only"]).stdout;
+        assert!(staged.lines().any(|path| path == artifact));
+        assert!(!repo.path().join(".gitignore").exists());
+    }
+
+    #[test]
+    fn prepare_artifacts_refuses_when_later_negation_defeats_existing_rule() {
+        let repo = initialized_test_repo();
+        write_test_file(
+            repo.path(),
+            ".gitignore",
+            "project/obj/\n!project/obj/\n!project/obj/generated.cs\n",
+        );
+        git_test(repo.path(), &["add", ".gitignore"]);
+        git_test(repo.path(), &["commit", "-m", "ignore rules"]);
+        let artifact = "project/obj/generated.cs";
+        write_test_file(repo.path(), artifact, "// generated\n");
+        git_test(repo.path(), &["add", artifact]);
+
+        let error = prepare_artifact_exclusions(repo.path()).expect_err("must fail closed");
+        assert!(error.contains("refusing blanket staging"), "{error}");
+        let staged = run_git_captured(repo.path(), &["diff", "--cached", "--name-only"]).stdout;
+        assert!(staged.lines().any(|path| path == artifact));
+        assert!(repo.path().join(artifact).is_file());
+    }
+
+    #[test]
+    fn validate_gitignore_patterns_rejects_line_injection() {
+        let error = validate_gitignore_patterns(&["project\n*.rs".to_string()])
+            .expect_err("line breaks must fail closed");
+        assert!(error.contains("line break"), "{error}");
+    }
+
+    fn initialized_test_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("temp repo");
+        git_test(repo.path(), &["init"]);
+        git_test(repo.path(), &["config", "user.name", "Shove Test"]);
+        git_test(
+            repo.path(),
+            &["config", "user.email", "shove-test@example.com"],
+        );
+        write_test_file(repo.path(), "README.md", "base\n");
+        git_test(repo.path(), &["add", "README.md"]);
+        git_test(repo.path(), &["commit", "-m", "base"]);
+        repo
+    }
+
+    fn git_test(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {} failed:\n{}{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn write_test_file(repo: &Path, relative: &str, content: &str) {
+        let path = repo.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(path, content).expect("write fixture");
     }
 }
