@@ -61,9 +61,9 @@ pub use pull::{
     PULL_BACKUP_PREFIX,
 };
 pub use shove::{
-    backup_branch_names, create_backup_branches, shove, shove_backup_branch_names, CapturedGit,
-    CommitOutcome, ConflictContext, ConflictKind, ConflictResolver, PushDecision, ShoveOptions,
-    SHOVE_BACKUP_PREFIX,
+    backup_branch_names, create_backup_branches, prepare_artifact_exclusions, shove,
+    shove_backup_branch_names, ArtifactExclusion, CapturedGit, CommitOutcome, ConflictContext,
+    ConflictKind, ConflictResolver, PushDecision, ShoveOptions, SHOVE_BACKUP_PREFIX,
 };
 pub use biometric::require_biometric;
 pub use lock::{
