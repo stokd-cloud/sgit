@@ -38,10 +38,10 @@ enum Commands {
         #[arg(value_name = "REF")]
         git_ref: Option<String>,
     },
-    /// Ensure a sibling worktree for a branch, or the main worktree for a repo, and print its path
+    /// Ensure a sibling worktree for a branch of the current repo and print its path
     Checkout {
-        /// Branch name, `owner/repo`, or bare repo name (shell wrapper cds into the printed path)
-        #[arg(value_name = "TARGET")]
+        /// Branch name (shell wrapper cds into the printed worktree path)
+        #[arg(value_name = "BRANCH")]
         branch: String,
     },
     /// Headlessly provision a repo in the bare + worktree layout (no editor)
