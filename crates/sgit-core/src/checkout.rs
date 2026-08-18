@@ -1,13 +1,9 @@
-//! Pin-safe checkout (AX-CLI-CHECKOUT-SIBLING-WORKTREE + AX-CLI-CHECKOUT-REPO-TARGET).
+//! Pin-safe checkout (AX-CLI-CHECKOUT-SIBLING-WORKTREE).
 //!
-//! `sgit checkout` accepts two target classes:
-//!
-//! 1. **Branch** — never switches the current worktree in place; reuses or
-//!    creates a sibling linked worktree under the configured worktree root.
-//! 2. **Repo** (`owner/repo` or bare `reponame`) — ensures the bare + main
-//!    worktree layout (creating missing parents, clone if needed), repairs
-//!    destinations that exist without a valid git connection when safe, and
-//!    returns the absolute main worktree path for the shell wrapper to `cd`.
+//! `sgit checkout` is branch-only: it never switches the current worktree in
+//! place and instead reuses or creates a sibling linked worktree. Repository
+//! provisioning helpers remain available to explicit repo commands, but are not
+//! part of checkout target routing.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,10 +39,11 @@ pub struct EnsureRepoWorktree {
     pub source: String,
 }
 
-/// How `sgit checkout <target>` should interpret its argument (first pass).
+/// Compatibility classification for checkout arguments.
 ///
-/// Repo specs still need owner resolution (bare names) and may fall back to
-/// branch create when resolution fails while inside a git repo.
+/// The CLI rejects invocation outside a repository before classification. For
+/// callers that still use this helper, every target inside a repository is a
+/// branch, regardless of its shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutKind {
     /// Ensure a sibling worktree for this branch of the current repo.
@@ -55,143 +52,23 @@ pub enum CheckoutKind {
     RepoSpec(String),
 }
 
-/// Classify a checkout argument.
-///
-/// Rules (AX-CLI-CHECKOUT-REPO-TARGET):
-/// - **Outside** a git repo → always [`CheckoutKind::RepoSpec`].
-/// - **Inside** a git repo:
-///   - local or `origin/<name>` branch exists → Branch
-///   - slash form matching a branch namespace (`feature/`, `task/`, `fix/`, …)
-///     → Branch (agents create these constantly; must not be misread as owner/repo)
-///   - slash form whose `owner/repo` already exists under configured bare/worktree
-///     roots → RepoSpec
-///   - bare name with no matching branch → RepoSpec (owner resolution later;
-///     may fall back to branch create on failure)
-///   - other slash form with no local layout match → Branch (new sibling branch)
-///
-/// `cfg` is optional: when provided, local bare/worktree layout is consulted for
-/// slash-form repo detection. When `None`, slash form outside a known branch
-/// namespace is still treated as Branch while inside a repo (safe default).
+/// Classify a checkout argument. Every target inside a repository is a branch;
+/// outside-repository classification is retained only for API compatibility.
 pub fn classify_checkout_target(raw: &str, repo_root: Option<&Path>) -> CheckoutKind {
     classify_checkout_target_with_cfg(raw, repo_root, None)
 }
 
-/// Like [`classify_checkout_target`] but consults `cfg` for local repo layout.
+/// Like [`classify_checkout_target`]; `cfg` is retained for API compatibility.
 pub fn classify_checkout_target_with_cfg(
     raw: &str,
     repo_root: Option<&Path>,
-    cfg: Option<&RepositoriesConfig>,
+    _cfg: Option<&RepositoriesConfig>,
 ) -> CheckoutKind {
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return CheckoutKind::RepoSpec(String::new());
+    match repo_root {
+        Some(_) => CheckoutKind::Branch(trimmed.to_string()),
+        None => CheckoutKind::RepoSpec(trimmed.to_string()),
     }
-
-    let Some(root) = repo_root else {
-        return CheckoutKind::RepoSpec(trimmed.to_string());
-    };
-
-    // Existing branch (local or origin) always wins.
-    if branch_exists_local(root, trimmed) || branch_exists_remote(root, trimmed) {
-        return CheckoutKind::Branch(trimmed.to_string());
-    }
-
-    if !trimmed.contains('/') {
-        // Bare name, no matching branch → try as repo (owner resolution).
-        return CheckoutKind::RepoSpec(trimmed.to_string());
-    }
-
-    // Slash form, no matching branch.
-    if looks_like_branch_namespace(trimmed) {
-        return CheckoutKind::Branch(trimmed.to_string());
-    }
-
-    // Slash form that is not a branch namespace: prefer repo (local layout or
-    // remote ensure). CLI falls back to branch create if owner resolution /
-    // clone fails while still inside a git repo.
-    if let Some((owner, repo)) = trimmed.split_once('/') {
-        if !owner.is_empty()
-            && !repo.is_empty()
-            && !repo.contains('/')
-            && (cfg
-                .map(|c| local_repo_layout_exists(c, trimmed))
-                .unwrap_or(false)
-                || looks_like_owner_repo_pair(owner, repo))
-        {
-            return CheckoutKind::RepoSpec(trimmed.to_string());
-        }
-    }
-
-    // Default while inside a repo: new sibling branch.
-    CheckoutKind::Branch(trimmed.to_string())
-}
-
-/// Heuristic: owner and repo segments look like GitHub slugs (not multi-path branch names).
-fn looks_like_owner_repo_pair(owner: &str, repo: &str) -> bool {
-    // Reject path-like or ref-like junk.
-    if owner.starts_with('.') || repo.starts_with('.') {
-        return false;
-    }
-    if owner.contains('\\') || repo.contains('\\') {
-        return false;
-    }
-    // GitHub owner/repo segments are typically [A-Za-z0-9._-] with at least one letter.
-    let ok = |s: &str| {
-        !s.is_empty()
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-            && s.chars().any(|c| c.is_ascii_alphabetic())
-    };
-    ok(owner) && ok(repo)
-}
-
-/// Common multi-segment branch prefixes that must never be treated as owner/repo.
-fn looks_like_branch_namespace(raw: &str) -> bool {
-    const PREFIXES: &[&str] = &[
-        "feature/",
-        "feat/",
-        "fix/",
-        "bugfix/",
-        "hotfix/",
-        "chore/",
-        "docs/",
-        "refactor/",
-        "test/",
-        "ci/",
-        "build/",
-        "release/",
-        "task/",
-        "project/",
-        "wip/",
-        "tmp/",
-        "temp/",
-        "claude/",
-        "codex/",
-        "cursor/",
-        "agent/",
-        "dependabot/",
-        "renovate/",
-    ];
-    let lower = raw.to_ascii_lowercase();
-    PREFIXES.iter().any(|p| lower.starts_with(p))
-}
-
-/// True when bare and/or worktree root already has `owner/repo` provisioned.
-fn local_repo_layout_exists(cfg: &RepositoriesConfig, owner_repo: &str) -> bool {
-    let Some((owner, repo)) = owner_repo.split_once('/') else {
-        return false;
-    };
-    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
-        return false;
-    }
-    let bare = PathBuf::from(&cfg.bare_root)
-        .join(owner)
-        .join(format!("{repo}.git"));
-    if bare.is_dir() {
-        return true;
-    }
-    let wt = PathBuf::from(&cfg.worktree_root).join(owner).join(repo);
-    wt.is_dir()
 }
 
 /// Ensure bare + main worktree for `owner/repo` using the GitHub SSH remote.
@@ -417,14 +294,19 @@ pub fn ensure_branch_worktree(
         )
     })?;
 
-    // Reuse an existing worktree for this branch (any location).
+    // Reuse a live existing worktree for this branch (any location). Git keeps
+    // manually deleted worktrees registered until pruned; never return such a
+    // nonexistent path to the shell wrapper.
     if let Ok(existing) = find_worktree_for_branch_at(&repo_root, &branch) {
-        let path = canonicalize_existing(&existing);
-        return Ok(EnsureBranchWorktree {
-            path,
-            created: false,
-            source: format!("existing worktree for branch {branch}"),
-        });
+        if existing.is_dir() && detect_repo_root_at(&existing).is_some() {
+            let path = canonicalize_existing(&existing);
+            return Ok(EnsureBranchWorktree {
+                path,
+                created: false,
+                source: format!("existing worktree for branch {branch}"),
+            });
+        }
+        prune_missing_worktree_registrations(&repo_root)?;
     }
 
     let path = preferred_branch_worktree_path(&repo_root, cfg, &branch);
@@ -460,6 +342,25 @@ pub fn ensure_branch_worktree(
         created: true,
         source,
     })
+}
+
+/// Remove registrations whose worktree directories no longer exist so an
+/// existing branch can be materialized again at its preferred path.
+fn prune_missing_worktree_registrations(repo_root: &Path) -> Result<(), String> {
+    let common = resolve_common_git_dir(repo_root)
+        .unwrap_or_else(|| repo_root.to_path_buf());
+    let output = Command::new("git")
+        .args(["worktree", "prune", "--expire", "now"])
+        .current_dir(&common)
+        .output()
+        .map_err(|e| format!("failed to prune missing worktrees: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "failed to prune missing worktrees: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
 }
 
 /// Create a linked worktree at `path` for `branch` from the common git dir.
@@ -772,28 +673,23 @@ mod tests {
     }
 
     #[test]
-    fn classify_owner_repo_uses_local_layout_or_outside_repo() {
+    fn classify_every_target_as_a_branch_inside_repo() {
         let (tmp, primary) = scratch_repo();
         let cfg = test_cfg(tmp.path());
-        // GitHub-shaped owner/repo → try as repo (CLI falls back to branch if missing).
-        assert_eq!(
-            classify_checkout_target_with_cfg("acme/widget", Some(&primary), Some(&cfg)),
-            CheckoutKind::RepoSpec("acme/widget".into())
-        );
-        // Local layout present → still repo.
-        std::fs::create_dir_all(PathBuf::from(&cfg.worktree_root).join("acme").join("widget"))
-            .unwrap();
-        assert_eq!(
-            classify_checkout_target_with_cfg("acme/widget", Some(&primary), Some(&cfg)),
-            CheckoutKind::RepoSpec("acme/widget".into())
-        );
-        // Local branch always wins.
-        git(&primary, &["branch", "acme/widget"]);
+        // Slash-shaped names are valid branches and are never repository targets.
         assert_eq!(
             classify_checkout_target_with_cfg("acme/widget", Some(&primary), Some(&cfg)),
             CheckoutKind::Branch("acme/widget".into())
         );
-        // Outside a repo always repo.
+        // A matching repository layout does not change checkout interpretation.
+        std::fs::create_dir_all(PathBuf::from(&cfg.worktree_root).join("acme").join("widget"))
+            .unwrap();
+        assert_eq!(
+            classify_checkout_target_with_cfg("acme/widget", Some(&primary), Some(&cfg)),
+            CheckoutKind::Branch("acme/widget".into())
+        );
+        // The compatibility helper retains its old outside-repo classification;
+        // the checkout CLI rejects that context before calling it.
         assert_eq!(
             classify_checkout_target("acme/widget", None),
             CheckoutKind::RepoSpec("acme/widget".into())
@@ -821,17 +717,17 @@ mod tests {
     }
 
     #[test]
-    fn classify_bare_name_prefers_existing_branch() {
+    fn classify_bare_name_as_branch_whether_or_not_it_exists() {
         let (tmp, primary) = scratch_repo();
         git(&primary, &["branch", "release"]);
         assert_eq!(
             classify_checkout_target("release", Some(&primary)),
             CheckoutKind::Branch("release".into())
         );
-        // No such branch → repo spec (owner resolution happens later).
+        // A missing branch is created; it is never retried as a repository.
         assert_eq!(
             classify_checkout_target("totally-unknown-xyz", Some(&primary)),
-            CheckoutKind::RepoSpec("totally-unknown-xyz".into())
+            CheckoutKind::Branch("totally-unknown-xyz".into())
         );
         let _ = tmp;
     }
