@@ -223,6 +223,12 @@ pub const SGIT_HOOKS_SUBDIR: &str = "sgit-hooks";
 ///
 /// Returns the reconcile result for the anchor repo.
 pub fn ensure_pin_and_hook(anchor: &Path, off: bool) -> Result<ReconcileResult, String> {
+    // Repair a hub whose bare-ness is not honored (extensions.worktreeConfig
+    // enabled without the core.bare override) before enumerating worktrees —
+    // otherwise the hub reads as a second checkout and leaks into the pin set.
+    if let Some(common) = resolve_common_git_dir(anchor) {
+        crate::layout::heal_hub_bare_with_notice(&common);
+    }
     if !off {
         install_reference_transaction_hook(anchor)?;
     }
@@ -907,6 +913,57 @@ mod tests {
         let (ok, stderr) = git_try(&wt, &["checkout", "--detach", "-q"]);
         assert!(ok, "detaching HEAD must remain allowed: {stderr}");
         assert_eq!(head_symref(&wt), "<detached>");
+    }
+
+    /// A hub whose `extensions.worktreeConfig` was enabled without migrating
+    /// `core.bare` reads as a second checkout of its HEAD branch, so it leaks
+    /// into the pinnable-worktree enumeration. Pinning must heal the hub
+    /// (restore the honored `bare` flag) instead of tripping over it.
+    #[test]
+    fn ensure_pin_and_hook_heals_hub_bare() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init", "-q", "-b", "main"]);
+        git(&seed, &["config", "user.email", "t@t.co"]);
+        git(&seed, &["config", "user.name", "t"]);
+        git(&seed, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let hub = tmp.path().join("hub.git");
+        git(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().unwrap(),
+                hub.to_str().unwrap(),
+            ],
+        );
+        let wt = tmp.path().join("main");
+        git(&hub, &["worktree", "add", "-q", wt.to_str().unwrap(), "main"]);
+
+        // Reproduce the incident state: extension on, per-worktree override on
+        // the linked worktree, nothing migrated for the hub itself.
+        git(&hub, &["config", "extensions.worktreeConfig", "true"]);
+        git(&wt, &["config", "--worktree", "core.bare", "false"]);
+        assert!(
+            list_worktree_paths(&wt)
+                .iter()
+                .any(|p| crate::layout::same_path(p, &hub)),
+            "precondition: the broken hub leaks into the worktree enumeration"
+        );
+
+        ensure_pin_and_hook(&wt, false).expect("pin succeeds");
+
+        assert!(
+            !list_worktree_paths(&wt)
+                .iter()
+                .any(|p| crate::layout::same_path(p, &hub)),
+            "after pinning, the hub reads as bare again and is excluded"
+        );
+        let cfg = std::fs::read_to_string(hub.join("config.worktree"))
+            .expect("hub config.worktree written by the heal");
+        assert!(cfg.contains("bare = true"));
     }
 
     #[test]
