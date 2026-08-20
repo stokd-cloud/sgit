@@ -419,8 +419,17 @@ fn create_branch_worktree(
         )
     } else {
         let default = resolve_default_branch_at(repo_root);
+        // `--no-track` is mandatory (AX-SGIT-BRANCH-UPSTREAM-SELF): the start
+        // point is a remote-tracking branch, so git's default
+        // `branch.autoSetupMerge=true` would set this NEW branch's upstream to
+        // the BASE (`refs/heads/<default>`). Under `push.default = upstream` a
+        // later push of the feature branch then resolves its destination to the
+        // base and writes onto it. The `--track` arm above is the deliberate
+        // exception: a branch whose `origin/<branch>` already exists must track
+        // ITSELF.
         (
             vec![
+                "--no-track".to_string(),
                 "-b".to_string(),
                 branch.to_string(),
                 path_str.clone(),
@@ -643,6 +652,95 @@ mod tests {
             String::from_utf8_lossy(&branch.stdout).trim(),
             "brand-new"
         );
+    }
+
+    /// Capture a git invocation's stdout WITHOUT asserting success —
+    /// `config --get` exits 1 for an unset key, which is the expected result
+    /// for the upstream assertions below.
+    fn git_capture(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Clone-backed fixture whose `origin/<default>` exists as a real
+    /// remote-tracking ref, configured with `push.default = upstream`.
+    ///
+    /// Both conditions are required to reproduce AX-SGIT-BRANCH-UPSTREAM-SELF:
+    /// a remote-tracking start point is what makes git's default
+    /// `branch.autoSetupMerge=true` write an inherited upstream, and
+    /// `push.default = upstream` is what turns that inherited upstream into a
+    /// push that targets the BASE branch. `scratch_repo()` has no origin, so it
+    /// cannot exercise this at all.
+    fn scratch_clone_with_origin() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempdir().expect("tempdir");
+        let (_remote, url) = seed_remote_repo(tmp.path());
+        let primary = tmp.path().join("primary");
+        git(
+            tmp.path(),
+            &["clone", "-q", url.as_str(), primary.to_str().unwrap()],
+        );
+        git(&primary, &["config", "user.email", "t@t.co"]);
+        git(&primary, &["config", "user.name", "t"]);
+        git(&primary, &["config", "push.default", "upstream"]);
+        (tmp, primary)
+    }
+
+    /// AX-SGIT-BRANCH-UPSTREAM-SELF: a branch cut off `origin/<default>` must
+    /// carry NO upstream. Git's default `branch.autoSetupMerge=true` would
+    /// otherwise set this new branch's upstream to the BASE (`refs/heads/main`),
+    /// and under `push.default = upstream` every later push of the feature
+    /// branch would then write onto main.
+    #[test]
+    fn new_branch_worktree_has_no_inherited_upstream() {
+        let (tmp, primary) = scratch_clone_with_origin();
+        let cfg = test_cfg(tmp.path());
+
+        let result = ensure_branch_worktree(&primary, "task/abc1234-fresh", &cfg).unwrap();
+        assert!(result.created);
+
+        let merge = git_capture(
+            &primary,
+            &["config", "--get", "branch.task/abc1234-fresh.merge"],
+        );
+        assert!(
+            merge.is_empty(),
+            "a newly cut feature branch must have NO upstream; inheriting \
+             refs/heads/main makes every push target main (got {merge:?})"
+        );
+        let _ = tmp;
+    }
+
+    /// The complement, guarding against over-correction: when `origin/<branch>`
+    /// already exists the branch MUST track ITSELF, so `--no-track` may only be
+    /// added to the new-branch arm.
+    #[test]
+    fn remote_backed_branch_worktree_tracks_itself() {
+        let (tmp, primary) = scratch_clone_with_origin();
+        let cfg = test_cfg(tmp.path());
+        // Publish the branch so the `remote` arm is the one selected.
+        git(
+            &primary,
+            &["push", "-q", "origin", "main:refs/heads/task/already-remote"],
+        );
+        git(&primary, &["fetch", "-q", "origin"]);
+
+        let result = ensure_branch_worktree(&primary, "task/already-remote", &cfg).unwrap();
+        assert!(result.created);
+
+        let merge = git_capture(
+            &primary,
+            &["config", "--get", "branch.task/already-remote.merge"],
+        );
+        assert_eq!(
+            merge, "refs/heads/task/already-remote",
+            "a branch whose remote counterpart exists must track itself"
+        );
+        let _ = tmp;
     }
 
     #[test]

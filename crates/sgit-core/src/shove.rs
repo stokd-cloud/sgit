@@ -174,15 +174,36 @@ pub fn shove(
     }
 }
 
+/// Explicit push refspec for `branch` (AX-SGIT-BRANCH-UPSTREAM-SELF).
+///
+/// A source-only refspec (`push origin <branch>`) leaves the DESTINATION to
+/// `push.default`. Under `push.default = upstream` — and a branch that inherited
+/// `merge = refs/heads/<base>` from the remote-tracking start point it was cut
+/// from — that destination resolves to the BASE branch, so pushing a feature
+/// branch silently writes onto main. Naming the destination removes the
+/// ambiguity regardless of local config. Pure; unit-tested.
+pub fn push_refspec(branch: &str) -> String {
+    let short = branch
+        .trim()
+        .strip_prefix("refs/heads/")
+        .unwrap_or_else(|| branch.trim());
+    format!("HEAD:refs/heads/{short}")
+}
+
 /// Push `branch` to origin. On non-fast-forward divergence: snapshot backup
 /// branches, `pull --rebase`, invoke `resolver` when content conflicts remain,
 /// then push again.
+///
+/// `--set-upstream` is retained deliberately: combined with the explicit
+/// refspec it REPAIRS a branch that already carries a base-pointing upstream
+/// from before this fix, so historical branches self-heal on their next push.
 pub fn push_with_sync(
     repo_root: &Path,
     branch: &str,
     resolver: &dyn ConflictResolver,
 ) -> Result<(), String> {
-    match run_git_with_stderr(repo_root, &["push", "--set-upstream", "origin", branch]) {
+    let refspec = push_refspec(branch);
+    match run_git_with_stderr(repo_root, &["push", "--set-upstream", "origin", &refspec]) {
         Ok(_) => Ok(()),
         Err(combined) if is_divergence_error(&combined) => {
             println!("Remote has diverged. Creating safety backups, then rebasing local commits on top of remote...");
@@ -190,7 +211,7 @@ pub fn push_with_sync(
             if run_git(repo_root, &["pull", "--rebase", "origin", branch]).is_err() {
                 resolve_rebase_conflicts(repo_root, branch, resolver)?;
             }
-            run_git(repo_root, &["push", "--set-upstream", "origin", branch])?;
+            run_git(repo_root, &["push", "--set-upstream", "origin", &refspec])?;
             Ok(())
         }
         Err(error) => Err(format!("git push failed: {error}")),
@@ -1699,6 +1720,132 @@ mod tests {
         let error = validate_gitignore_patterns(&["project\n*.rs".to_string()])
             .expect_err("line breaks must fail closed");
         assert!(error.contains("line break"), "{error}");
+    }
+
+    /// AX-SGIT-BRANCH-UPSTREAM-SELF: the refspec must always name the
+    /// destination ref, so `push.default` can never redirect it to the base.
+    #[test]
+    fn push_refspec_always_names_the_destination_branch() {
+        assert_eq!(push_refspec("feat"), "HEAD:refs/heads/feat");
+        assert_eq!(
+            push_refspec("task/abc1234-slug"),
+            "HEAD:refs/heads/task/abc1234-slug"
+        );
+        // Already-qualified input must not double-prefix.
+        assert_eq!(
+            push_refspec("refs/heads/feat"),
+            "HEAD:refs/heads/feat"
+        );
+        // Surrounding whitespace never leaks into the ref.
+        assert_eq!(push_refspec("  feat  "), "HEAD:refs/heads/feat");
+        // The destination is present in every case — the property that matters.
+        for branch in ["a", "feature/x", "refs/heads/y", " z "] {
+            assert!(
+                push_refspec(branch).contains(":refs/heads/"),
+                "refspec for {branch:?} must name a destination ref"
+            );
+        }
+    }
+
+    struct NoopResolver;
+    impl ConflictResolver for NoopResolver {
+        fn resolve(&self, _ctx: &ConflictContext) -> Result<(), String> {
+            Err("test resolver must not be invoked".to_string())
+        }
+    }
+
+    fn rev_parse(dir: &Path, rev: &str) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", rev])
+            .output()
+            .expect("run git");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// AX-SGIT-BRANCH-UPSTREAM-SELF (push half): a push must name its
+    /// destination explicitly, so a feature branch that inherited
+    /// `merge = refs/heads/main` still lands on ITSELF and never on the base.
+    ///
+    /// The fixture deliberately reproduces the destructive combination: a branch
+    /// cut off `origin/main` WITHOUT `--no-track` (so it inherits the base as
+    /// its upstream) plus `push.default = upstream` (so a source-only refspec
+    /// resolves its destination to that upstream). Without an explicit refspec
+    /// this pushes onto main.
+    #[test]
+    fn push_lands_on_the_feature_branch_never_the_base() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git_test(&seed, &["init", "-q", "-b", "main"]);
+        git_test(&seed, &["config", "user.name", "Shove Test"]);
+        git_test(&seed, &["config", "user.email", "shove-test@example.com"]);
+        write_test_file(&seed, "README.md", "base\n");
+        git_test(&seed, &["add", "README.md"]);
+        git_test(&seed, &["commit", "-q", "-m", "base"]);
+
+        let remote = tmp.path().join("remote.git");
+        git_test(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ],
+        );
+
+        let local = tmp.path().join("local");
+        git_test(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                local.to_str().unwrap(),
+            ],
+        );
+        git_test(&local, &["config", "user.name", "Shove Test"]);
+        git_test(&local, &["config", "user.email", "shove-test@example.com"]);
+        git_test(&local, &["config", "push.default", "upstream"]);
+
+        // Cut the branch the OLD way so it inherits `merge = refs/heads/main`.
+        git_test(&local, &["checkout", "-q", "-b", "feat", "origin/main"]);
+        assert_eq!(
+            {
+                let out = Command::new("git")
+                    .arg("-C")
+                    .arg(&local)
+                    .args(["config", "--get", "branch.feat.merge"])
+                    .output()
+                    .expect("run git");
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            },
+            "refs/heads/main",
+            "fixture precondition: feat must start with the inherited upstream"
+        );
+
+        write_test_file(&local, "feature.txt", "work\n");
+        git_test(&local, &["add", "feature.txt"]);
+        git_test(&local, &["commit", "-q", "-m", "feature work"]);
+
+        let main_before = rev_parse(&remote, "refs/heads/main");
+        let feat_tip = rev_parse(&local, "HEAD");
+
+        push_with_sync(&local, "feat", &NoopResolver).expect("push succeeds");
+
+        assert_eq!(
+            rev_parse(&remote, "refs/heads/main"),
+            main_before,
+            "pushing a feature branch must NOT move the base branch"
+        );
+        assert_eq!(
+            rev_parse(&remote, "refs/heads/feat"),
+            feat_tip,
+            "the feature branch's own ref must carry the commit"
+        );
     }
 
     fn initialized_test_repo() -> tempfile::TempDir {
