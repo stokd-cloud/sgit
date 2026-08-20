@@ -182,7 +182,11 @@ pub fn push_with_sync(
     branch: &str,
     resolver: &dyn ConflictResolver,
 ) -> Result<(), String> {
-    match run_git_with_stderr(repo_root, &["push", "--set-upstream", "origin", branch]) {
+    let refspec = format!("HEAD:refs/heads/{branch}");
+    match run_git_with_stderr(
+        repo_root,
+        &["push", "--set-upstream", "origin", &refspec],
+    ) {
         Ok(_) => Ok(()),
         Err(combined) if is_divergence_error(&combined) => {
             println!("Remote has diverged. Creating safety backups, then rebasing local commits on top of remote...");
@@ -190,7 +194,10 @@ pub fn push_with_sync(
             if run_git(repo_root, &["pull", "--rebase", "origin", branch]).is_err() {
                 resolve_rebase_conflicts(repo_root, branch, resolver)?;
             }
-            run_git(repo_root, &["push", "--set-upstream", "origin", branch])?;
+            run_git(
+                repo_root,
+                &["push", "--set-upstream", "origin", &refspec],
+            )?;
             Ok(())
         }
         Err(error) => Err(format!("git push failed: {error}")),
@@ -1737,5 +1744,94 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create parent");
         }
         std::fs::write(path, content).expect("write fixture");
+    }
+
+    struct NoResolver;
+    impl ConflictResolver for NoResolver {
+        fn resolve(&self, _ctx: &ConflictContext) -> Result<(), String> {
+            Err("unexpected conflict in shove push fixture".into())
+        }
+    }
+
+    fn scrub_git_env() {
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_PREFIX",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_NAMESPACE",
+            "GIT_CONFIG_PARAMETERS",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn git_sha(repo: &Path, rev: &str) -> String {
+        run_git_captured(repo, &["rev-parse", rev])
+            .stdout
+            .trim()
+            .to_string()
+    }
+
+    /// Feature branch whose configured upstream is the BASE (`main`), plus
+    /// `push.default=upstream` — the combo that destination-less push hijacks.
+    fn inherited_upstream_push_fixture() -> (tempfile::TempDir, PathBuf) {
+        scrub_git_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        git_test(&local, &["init", "-q", "-b", "main"]);
+        git_test(&local, &["config", "user.name", "Shove Test"]);
+        git_test(&local, &["config", "user.email", "shove-test@example.com"]);
+        write_test_file(&local, "README.md", "base\n");
+        git_test(&local, &["add", "README.md"]);
+        git_test(&local, &["commit", "-m", "base"]);
+        let bare = tmp.path().join("origin.git");
+        git_test(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                local.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        git_test(
+            &local,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+        );
+        git_test(&local, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        git_test(&local, &["checkout", "-q", "-b", "feat-push"]);
+        write_test_file(&local, "feat.txt", "feature\n");
+        git_test(&local, &["add", "feat.txt"]);
+        git_test(&local, &["commit", "-m", "feat"]);
+        git_test(&local, &["config", "push.default", "upstream"]);
+        git_test(&local, &["config", "branch.feat-push.remote", "origin"]);
+        git_test(&local, &["config", "branch.feat-push.merge", "refs/heads/main"]);
+        git_test(&local, &["fetch", "-q", "origin"]);
+        (tmp, local)
+    }
+
+    #[test]
+    fn push_with_sync_advances_feature_branch_not_default() {
+        let (_tmp, local) = inherited_upstream_push_fixture();
+        let main_before = git_sha(&local, "origin/main");
+        let feat_tip = git_sha(&local, "HEAD");
+        push_with_sync(&local, "feat-push", &NoResolver).expect("push");
+        git_test(&local, &["fetch", "-q", "origin"]);
+        assert_eq!(
+            git_sha(&local, "origin/feat-push"),
+            feat_tip,
+            "feature branch must land on origin/<branch>"
+        );
+        assert_eq!(
+            git_sha(&local, "origin/main"),
+            main_before,
+            "origin/main must be unchanged"
+        );
+        assert_ne!(feat_tip, main_before);
     }
 }

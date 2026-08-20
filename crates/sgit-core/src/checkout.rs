@@ -518,8 +518,13 @@ fn create_branch_worktree(
         )
     } else {
         let default = resolve_default_branch_at(repo_root);
+        // `--no-track` is mandatory: the start point is a remote-tracking
+        // branch, so git's default `branch.autoSetupMerge=true` would set this
+        // NEW branch's upstream to `refs/heads/<base>`. Under
+        // `push.default=upstream` a destination-less push then targets the base.
         (
             vec![
+                "--no-track".to_string(),
                 "-b".to_string(),
                 branch.to_string(),
                 path_str.clone(),
@@ -549,7 +554,7 @@ fn create_branch_worktree(
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "HEAD".to_string());
-            match run(&["-b", branch, &path_str, &head_commit]) {
+            match run(&["--no-track", "-b", branch, &path_str, &head_commit]) {
                 Ok(o) if o.status.success() => Ok((
                     path.to_path_buf(),
                     format!("new branch off HEAD ({head_commit})"),
@@ -964,5 +969,111 @@ mod tests {
             "err was: {err}"
         );
         assert!(dest.join("precious.txt").is_file(), "must not destroy content");
+    }
+
+    fn scrub_git_env() {
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_PREFIX",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_NAMESPACE",
+            "GIT_CONFIG_PARAMETERS",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn git_config_get(dir: &Path, key: &str) -> Option<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["config", "--get", key])
+            .output()
+            .expect("git config");
+        if !out.status.success() {
+            return None;
+        }
+        let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    /// Local clone with `origin` and `push.default=upstream` — the machine
+    /// config that turns an inherited base-branch upstream into a main hijack.
+    fn origin_scratch() -> (tempfile::TempDir, PathBuf) {
+        scrub_git_env();
+        let tmp = tempdir().expect("tempdir");
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        git(&local, &["init", "-q", "-b", "main"]);
+        git(&local, &["config", "user.email", "t@t.co"]);
+        git(&local, &["config", "user.name", "t"]);
+        git(&local, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let bare = tmp.path().join("origin.git");
+        git(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                local.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        git(
+            &local,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+        );
+        git(&local, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        git(&local, &["fetch", "-q", "origin"]);
+        git(&local, &["config", "push.default", "upstream"]);
+        (tmp, local)
+    }
+
+    #[test]
+    fn new_branch_cut_from_origin_has_no_inherited_upstream() {
+        let (tmp, local) = origin_scratch();
+        let cfg = test_cfg(tmp.path());
+        let result = ensure_branch_worktree(&local, "feat-no-track", &cfg).unwrap();
+        assert!(result.created);
+        assert_eq!(
+            git_config_get(&result.path, "branch.feat-no-track.merge"),
+            None,
+            "new branch must not inherit origin/main as upstream"
+        );
+        assert_eq!(
+            git_config_get(&result.path, "branch.feat-no-track.remote"),
+            None
+        );
+    }
+
+    #[test]
+    fn existing_origin_branch_tracks_itself() {
+        let (tmp, local) = origin_scratch();
+        git(&local, &["branch", "feat-remote"]);
+        git(
+            &local,
+            &["push", "-q", "origin", "HEAD:refs/heads/feat-remote"],
+        );
+        git(&local, &["branch", "-D", "feat-remote"]);
+        git(&local, &["fetch", "-q", "origin"]);
+        let cfg = test_cfg(tmp.path());
+        let result = ensure_branch_worktree(&local, "feat-remote", &cfg).unwrap();
+        assert!(result.created);
+        assert_eq!(
+            git_config_get(&result.path, "branch.feat-remote.merge").as_deref(),
+            Some("refs/heads/feat-remote"),
+            "--track arm must keep self-tracking"
+        );
+        assert_eq!(
+            git_config_get(&result.path, "branch.feat-remote.remote").as_deref(),
+            Some("origin")
+        );
     }
 }
