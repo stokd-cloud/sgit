@@ -378,6 +378,13 @@ fn create_branch_worktree(
     let common = resolve_common_git_dir(repo_root)
         .unwrap_or_else(|| repo_root.to_path_buf());
 
+    if let Err(e) = crate::apply_sgit_push_defaults(&common) {
+        eprintln!(
+            "warning: could not write sgit push defaults at {}: {e}",
+            common.display()
+        );
+    }
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             format!(

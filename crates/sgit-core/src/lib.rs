@@ -41,11 +41,11 @@ pub use submodule_checkout::{
     REPO_SUBMODULES_REL,
 };
 pub use layout::{
-    bare_clone, bare_clone_from_url, bare_placeholder_branch, create_worktree,
-    is_valid_linked_worktree, list_linked_worktrees, main_worktree_leaf, normalize_path,
-    parse_git_remote_url, point_bare_head_to_placeholder, render_worktree_name_pattern,
-    resolve_default_branch, resolve_origin_url, resolve_repo_layout, run_git_dir, same_path,
-    worktree_dir_for_branch, BARE_PLACEHOLDER_HEAD, RepoLayout,
+    apply_sgit_push_defaults, bare_clone, bare_clone_from_url, bare_placeholder_branch,
+    create_worktree, is_valid_linked_worktree, list_linked_worktrees, main_worktree_leaf,
+    normalize_path, parse_git_remote_url, point_bare_head_to_placeholder,
+    render_worktree_name_pattern, resolve_default_branch, resolve_origin_url, resolve_repo_layout,
+    run_git_dir, same_path, worktree_dir_for_branch, BARE_PLACEHOLDER_HEAD, RepoLayout,
 };
 pub use migrate_ops::{
     materialize_main_worktree, move_bare, move_worktree, ApplyStatus, UnsafeReason,

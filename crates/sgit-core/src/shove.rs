@@ -1811,14 +1811,19 @@ mod tests {
         git_test(&local, &["config", "user.email", "shove-test@example.com"]);
         git_test(&local, &["config", "push.default", "upstream"]);
 
-        // Cut the branch the OLD way so it inherits `merge = refs/heads/main`.
-        git_test(&local, &["checkout", "-q", "-b", "feat", "origin/main"]);
+        // Reproduce the inherited-upstream state explicitly. Do not rely on
+        // git's default `branch.autoSetupMerge=true` — an operator global of
+        // `simple` (or sgit's repo-local equivalent) would skip the inherit
+        // and this test would stop covering the shove refspec at all.
+        git_test(&local, &["checkout", "-q", "--no-track", "-b", "feat", "origin/main"]);
+        git_test(&local, &["config", "branch.feat.remote", "origin"]);
+        git_test(&local, &["config", "branch.feat.merge", "refs/heads/main"]);
         assert_eq!(
             {
                 let out = Command::new("git")
                     .arg("-C")
                     .arg(&local)
-                    .args(["config", "--get", "branch.feat.merge"])
+                    .args(["config", "--local", "--get", "branch.feat.merge"])
                     .output()
                     .expect("run git");
                 String::from_utf8_lossy(&out.stdout).trim().to_string()
