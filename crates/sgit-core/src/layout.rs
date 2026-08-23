@@ -291,8 +291,7 @@ pub fn create_worktree(
         return Err(format!("worktree creation failed: {stderr}"));
     }
 
-    ensure_main_worktree_not_bare(bare_dir, worktree_dir);
-    heal_hub_bare_with_notice(bare_dir);
+    ensure_worktree_not_bare(bare_dir, worktree_dir);
 
     if !is_valid_linked_worktree(worktree_dir, bare_dir) {
         return Err(format!(
@@ -331,17 +330,54 @@ fn prune_worktree_registration(bare: &Path, worktree: &Path) {
         .output();
 }
 
-/// When `bare` enables `extensions.worktreeConfig`, force `core.bare=false` on
-/// the new worktree so working-tree ops succeed (mirrors submodule attach).
-fn ensure_main_worktree_not_bare(bare: &Path, worktree: &Path) {
+/// Guarantee `worktree` is usable as a working tree under a hub that enables
+/// `extensions.worktreeConfig`.
+///
+/// The fix belongs to the hub: [`ensure_hub_bare_honored`] migrates `core.bare`
+/// out of the shared config, which frees every linked worktree at once —
+/// including trees created by plain `git worktree add`, which never reach this
+/// code. Only if that leaves the tree unusable (an unwritable hub, a shared
+/// config we declined to rewrite) do we fall back to the historical
+/// per-worktree `core.bare=false` override, and then the failure is reported
+/// rather than swallowed — a silently-skipped write is what let the broken
+/// state ship unnoticed.
+pub(crate) fn ensure_worktree_not_bare(bare: &Path, worktree: &Path) {
+    heal_hub_bare_with_notice(bare);
+
     if git_config_bool(bare, "extensions.worktreeConfig") != Some(true) {
         return;
     }
-    let _ = Command::new("git")
+    if git_config_bool(worktree, "core.bare") != Some(true) {
+        return;
+    }
+
+    let result = Command::new("git")
         .arg("-C")
         .arg(worktree)
         .args(["config", "--worktree", "core.bare", "false"])
-        .output();
+        .output()
+        .map_err(|e| format!("failed to run git config --worktree: {e}"))
+        .and_then(|out| {
+            if out.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+            }
+        });
+    match result {
+        Ok(()) => eprintln!(
+            "sgit: wrote a per-worktree core.bare=false at {} because hub {} \
+             still declares bare-ness to its worktrees",
+            worktree.display(),
+            bare.display()
+        ),
+        Err(e) => eprintln!(
+            "warning: {} inherits core.bare=true from hub {} and the \
+             per-worktree override could not be written: {e}",
+            worktree.display(),
+            bare.display()
+        ),
+    }
 }
 
 /// `git -C <dir> config --bool <key>`, or `None` when unset/unreadable.
@@ -390,29 +426,77 @@ pub fn ensure_hub_bare_honored(bare_dir: &Path) -> Result<bool, String> {
     if git_config_bool(bare_dir, "core.bare") != Some(true) {
         return Ok(false);
     }
-    if hub_override_bare(bare_dir) == Some(true) {
-        return Ok(false);
+
+    // Step 1 — the hub keeps its bare-ness, in the only place git still reads
+    // it from. Must happen before step 2 so the hub is never momentarily
+    // non-bare (a crash between the two would otherwise leave it a checkout).
+    let mut healed = false;
+    if hub_override_bare(bare_dir) != Some(true) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(bare_dir)
+            .args(["config", "--worktree", "core.bare", "true"])
+            .output()
+            .map_err(|e| format!("failed to run git config --worktree: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "could not restore the core.bare override on hub {}: {}",
+                bare_dir.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        if hub_override_bare(bare_dir) != Some(true) {
+            return Err(format!(
+                "hub {} still has no honored core.bare override after writing config.worktree",
+                bare_dir.display()
+            ));
+        }
+        healed = true;
     }
-    let out = Command::new("git")
+
+    // Step 2 — and the shared config stops broadcasting it to every worktree.
+    if shared_bare_is_set(bare_dir) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(bare_dir)
+            .args(["config", "--local", "--unset-all", "core.bare"])
+            .output()
+            .map_err(|e| format!("failed to run git config --local --unset-all: {e}"))?;
+        // Exit 5 is "key not found" — a concurrent heal got there first.
+        if !out.status.success() && out.status.code() != Some(5) {
+            return Err(format!(
+                "could not migrate core.bare out of the shared config on hub {}: {}",
+                bare_dir.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        if shared_bare_is_set(bare_dir) {
+            return Err(format!(
+                "hub {} still declares core.bare in its shared config, so linked \
+                 worktrees will keep inheriting bare-ness",
+                bare_dir.display()
+            ));
+        }
+        healed = true;
+    }
+
+    Ok(healed)
+}
+
+/// Whether the hub's *shared* `$GIT_DIR/config` declares `core.bare` at all.
+///
+/// Read with `--local` so the `config.worktree` override is excluded: the
+/// question is not what the hub resolves to, but whether the shared file still
+/// carries a key that `extensions.worktreeConfig` now broadcasts to every
+/// linked worktree.
+fn shared_bare_is_set(bare_dir: &Path) -> bool {
+    Command::new("git")
         .arg("-C")
         .arg(bare_dir)
-        .args(["config", "--worktree", "core.bare", "true"])
+        .args(["config", "--local", "--bool", "core.bare"])
         .output()
-        .map_err(|e| format!("failed to run git config --worktree: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "could not restore the core.bare override on hub {}: {}",
-            bare_dir.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    if hub_override_bare(bare_dir) != Some(true) {
-        return Err(format!(
-            "hub {} still has no honored core.bare override after writing config.worktree",
-            bare_dir.display()
-        ));
-    }
-    Ok(true)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// The hub's per-worktree `core.bare` override (`$GIT_DIR/config.worktree`),
@@ -781,5 +865,139 @@ mod tests {
             "must not create an override when the extension is off"
         );
         assert!(hub_stanza_reports_bare_from(&wt, &hub));
+        assert_eq!(
+            shared_bare(&hub),
+            Some(true),
+            "must not touch the shared config when the extension is off"
+        );
+    }
+
+    /// `core.bare` as recorded in the hub's *shared* `$GIT_DIR/config`
+    /// (`--local`), independent of any `config.worktree` override.
+    fn shared_bare(hub: &Path) -> Option<bool> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(hub)
+            .args(["config", "--local", "--bool", "core.bare"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        match String::from_utf8_lossy(&out.stdout).trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Whether `git status` succeeds in `wt` — i.e. git accepts it as a real
+    /// working tree rather than failing with "must be run in a work tree".
+    fn worktree_status_ok(wt: &Path) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(["status", "--porcelain"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn is_bare_repository(hub: &Path) -> bool {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(hub)
+            .args(["rev-parse", "--is-bare-repository"])
+            .output()
+            .expect("git runs");
+        String::from_utf8_lossy(&out.stdout).trim() == "true"
+    }
+
+    /// The real recurrence (2026-08-22): with `extensions.worktreeConfig` on,
+    /// git drops the special case that confines `core.bare` to the main
+    /// worktree, so the shared config's `bare = true` applies to *every* linked
+    /// worktree. Trees created by plain `git worktree add` — which never get
+    /// sgit's per-worktree `core.bare=false` band-aid — are born bare and fail
+    /// every working-tree command. Healing the hub must free them without
+    /// touching their own config.
+    #[test]
+    fn hub_bare_honored_frees_linked_worktrees() {
+        let (tmp, hub, _main_wt) = scratch_hub();
+        tgit(&hub, &["config", "extensions.worktreeConfig", "true"]);
+
+        let feat = tmp.path().join("feat");
+        tgit(
+            &hub,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                feat.to_str().unwrap(),
+                "-b",
+                "feat",
+            ],
+        );
+
+        assert!(
+            !worktree_status_ok(&feat),
+            "precondition: a plainly-added worktree inherits the shared \
+             `bare = true` and git refuses it as a work tree"
+        );
+        let feat_override = hub.join("worktrees/feat/config.worktree");
+        let before = std::fs::read(&feat_override).unwrap_or_default();
+
+        assert_eq!(ensure_hub_bare_honored(&hub), Ok(true), "heal applies");
+
+        assert!(
+            worktree_status_ok(&feat),
+            "healing the hub must free linked worktrees"
+        );
+        assert_eq!(
+            std::fs::read(&feat_override).unwrap_or_default(),
+            before,
+            "the worktree's own config must not be edited — the fix belongs to \
+             the hub, so trees created by any tool are covered"
+        );
+        assert!(
+            is_bare_repository(&hub),
+            "the hub itself must stay bare after the migration"
+        );
+    }
+
+    #[test]
+    fn hub_bare_honored_migration_is_idempotent() {
+        let (tmp, hub, _main_wt) = scratch_hub();
+        tgit(&hub, &["config", "extensions.worktreeConfig", "true"]);
+        let feat = tmp.path().join("feat");
+        tgit(
+            &hub,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                feat.to_str().unwrap(),
+                "-b",
+                "feat",
+            ],
+        );
+
+        assert_eq!(ensure_hub_bare_honored(&hub), Ok(true), "first call heals");
+        assert_eq!(
+            ensure_hub_bare_honored(&hub),
+            Ok(false),
+            "second call is a no-op"
+        );
+
+        assert!(is_bare_repository(&hub), "hub stays bare");
+        assert_eq!(
+            shared_bare(&hub),
+            None,
+            "`bare` is migrated out of the shared config, not left to leak \
+             into every linked worktree"
+        );
+        assert_eq!(
+            hub_override_bare(&hub),
+            Some(true),
+            "bare-ness now lives in the hub's config.worktree"
+        );
+        assert!(worktree_status_ok(&feat), "worktrees stay usable");
     }
 }

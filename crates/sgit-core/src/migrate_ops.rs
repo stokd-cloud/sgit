@@ -1,6 +1,7 @@
 //! Pure apply primitives for bare/worktree relocation (used by `sgit repo migrate`
 //! and `sgit repo rename`). No discovery/planning UI — just filesystem + git ops.
 
+use crate::layout::ensure_worktree_not_bare;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -150,7 +151,7 @@ pub fn move_bare(from: &Path, to: &Path, worktrees: &[WorktreeRepairTarget]) -> 
             .output();
         match repair {
             Ok(o) if o.status.success() => {
-                // Per-worktree core.bare=false when worktreeConfig is enabled.
+                // Keep the relocated hub's bare-ness off its worktrees.
                 ensure_worktree_not_bare(to, &wt.path);
             }
             Ok(o) => warnings.push(format!(
@@ -182,23 +183,3 @@ fn staging_path(from: &Path) -> PathBuf {
         .join(format!(".{name}.sgit-migrate-stage"))
 }
 
-/// When the bare uses `extensions.worktreeConfig` with shared `core.bare=true`,
-/// set a per-worktree `core.bare=false` override so working-tree ops work.
-fn ensure_worktree_not_bare(bare: &Path, worktree: &Path) {
-    let wt_config = Command::new("git")
-        .arg("-C")
-        .arg(bare)
-        .args(["config", "--bool", "extensions.worktreeConfig"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-    if wt_config.as_deref() != Some("true") {
-        return;
-    }
-    let _ = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["config", "--worktree", "core.bare", "false"])
-        .output();
-}

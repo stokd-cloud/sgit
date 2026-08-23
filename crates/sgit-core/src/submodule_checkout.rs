@@ -51,7 +51,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::layout::parse_git_remote_url;
+use crate::layout::{ensure_worktree_not_bare, parse_git_remote_url};
 
 /// How submodules are materialized inside a newly created superproject worktree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -732,31 +732,9 @@ fn attach_worktree_at(bare: &Path, dest: &Path, commit: &str) -> Result<(), Stri
     }
     // When the bare uses `extensions.worktreeConfig` with a shared
     // `core.bare=true`, the freshly-attached worktree inherits bare-ness and git
-    // rejects it as "not a work tree". Write a per-worktree `core.bare=false`.
+    // rejects it as "not a work tree".
     ensure_worktree_not_bare(bare, dest);
     Ok(())
-}
-
-/// When `bare` uses `extensions.worktreeConfig` with shared `core.bare=true`,
-/// set a per-worktree `core.bare=false` override in `worktree` so working-tree
-/// ops succeed. No-op when `extensions.worktreeConfig` is not enabled.
-fn ensure_worktree_not_bare(bare: &Path, worktree: &Path) {
-    let wt_config = Command::new("git")
-        .arg("-C")
-        .arg(bare)
-        .args(["config", "--bool", "extensions.worktreeConfig"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-    if wt_config.as_deref() != Some("true") {
-        return;
-    }
-    let _ = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["config", "--worktree", "core.bare", "false"])
-        .output();
 }
 
 /// Convenience: resolve mode for owner/repo then apply.
