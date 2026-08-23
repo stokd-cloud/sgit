@@ -191,7 +191,20 @@ pub fn bare_clone_from_url(remote_url: &str, bare_dir: &Path) -> Result<(), Stri
         write_default_branch_config(bare_dir, &branch);
     }
 
+    apply_sgit_push_defaults(bare_dir)?;
+
     point_bare_head_to_placeholder(bare_dir)?;
+    Ok(())
+}
+
+/// Repo-local git defaults so a new branch cut from `origin/<default>` does
+/// not inherit that base as upstream, and so `git push` with no upstream
+/// auto-tracks `origin/<same-name>` (AX-SGIT-BRANCH-UPSTREAM-SELF).
+///
+/// Written on the shared git dir (the hub), never the user global. Idempotent.
+pub fn apply_sgit_push_defaults(git_dir: &Path) -> Result<(), String> {
+    run_git_dir(git_dir, &["config", "branch.autoSetupMerge", "simple"])?;
+    run_git_dir(git_dir, &["config", "push.autoSetupRemote", "true"])?;
     Ok(())
 }
 
@@ -299,6 +312,13 @@ pub fn create_worktree(
             worktree_dir.display(),
             bare_dir.display()
         ));
+    }
+
+    if let Err(e) = apply_sgit_push_defaults(bare_dir) {
+        eprintln!(
+            "warning: could not write sgit push defaults at {}: {e}",
+            bare_dir.display()
+        );
     }
 
     if pin {
@@ -959,6 +979,128 @@ mod tests {
         assert!(
             is_bare_repository(&hub),
             "the hub itself must stay bare after the migration"
+        );
+    }
+
+    fn git_config_get(dir: &Path, key: &str) -> Option<String> {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["config", "--local", "--get", key])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Seed a non-bare repo with one commit on `main`, usable as a local origin.
+    fn seed_remote(dir: &Path) -> PathBuf {
+        let remote = dir.join("seed");
+        std::fs::create_dir_all(&remote).unwrap();
+        tgit(&remote, &["init", "-q", "-b", "main"]);
+        tgit(&remote, &["config", "user.email", "t@t.co"]);
+        tgit(&remote, &["config", "user.name", "t"]);
+        tgit(&remote, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        remote
+    }
+
+    /// AX-SGIT-BRANCH-UPSTREAM-SELF (repo-local defaults): a hub provisioned
+    /// by `bare_clone_from_url` must carry the two keys that stop a new branch
+    /// cut from `origin/<default>` inheriting that base as upstream, and that
+    /// make a no-upstream `git push` auto-track `origin/<same-name>`.
+    #[test]
+    fn bare_clone_sets_push_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = seed_remote(tmp.path());
+        let hub = tmp.path().join("hub.git");
+
+        bare_clone_from_url(&remote.to_string_lossy(), &hub).unwrap();
+
+        assert_eq!(
+            git_config_get(&hub, "branch.autoSetupMerge").as_deref(),
+            Some("simple"),
+            "sgit-provisioned hub must not inherit a mismatched remote as upstream"
+        );
+        assert_eq!(
+            git_config_get(&hub, "push.autoSetupRemote").as_deref(),
+            Some("true"),
+            "sgit-provisioned hub must auto-track origin/<same-name> on first push"
+        );
+    }
+
+    /// Outcome (not flag) test: after sgit clone, a raw `git worktree add -b`
+    /// off `origin/main` (no `--no-track`) must NOT write
+    /// `branch.<name>.merge = refs/heads/main`. That is the exact inheritance
+    /// that makes `git push` refuse or, under `push.default=upstream`, write
+    /// onto the base.
+    #[test]
+    fn bare_clone_prevents_inherited_upstream_on_mismatched_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = seed_remote(tmp.path());
+        let hub = tmp.path().join("hub.git");
+        bare_clone_from_url(&remote.to_string_lossy(), &hub).unwrap();
+
+        let main_wt = tmp.path().join("main");
+        create_worktree(&hub, &main_wt, "main", false).unwrap();
+        tgit(&hub, &["fetch", "-q", "origin"]);
+
+        // Isolate from the operator's ~/.gitconfig so this asserts the
+        // repo-local keys, not a coincidental global `autoSetupMerge=simple`.
+        let feat = tmp.path().join("task-foo");
+        let add = Command::new("git")
+            .arg("-C")
+            .arg(&hub)
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task/foo",
+                feat.to_str().unwrap(),
+                "origin/main",
+            ])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git worktree add runs");
+        assert!(
+            add.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+
+        assert_eq!(
+            git_config_get(&feat, "branch.task/foo.merge").as_deref(),
+            None,
+            "a newly cut feature branch must not inherit refs/heads/main as upstream \
+             (got {:?})",
+            git_config_get(&feat, "branch.task/foo.merge")
+        );
+    }
+
+    /// Already-cloned hubs (created before these keys existed) pick them up
+    /// the next time sgit materializes a worktree.
+    #[test]
+    fn create_worktree_backfills_push_defaults_on_existing_hub() {
+        let (tmp, hub, _wt) = scratch_hub();
+        assert_eq!(
+            git_config_get(&hub, "branch.autoSetupMerge"),
+            None,
+            "precondition: a raw-cloned hub has no sgit push defaults"
+        );
+
+        let extra = tmp.path().join("extra");
+        tgit(&hub, &["branch", "extra", "main"]);
+        create_worktree(&hub, &extra, "extra", false).unwrap();
+
+        assert_eq!(
+            git_config_get(&hub, "branch.autoSetupMerge").as_deref(),
+            Some("simple")
+        );
+        assert_eq!(
+            git_config_get(&hub, "push.autoSetupRemote").as_deref(),
+            Some("true")
         );
     }
 
