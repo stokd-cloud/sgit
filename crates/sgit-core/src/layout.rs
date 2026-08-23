@@ -962,6 +962,64 @@ mod tests {
         );
     }
 
+    /// The state eOne.Connector was actually found in on 2026-08-22, and the
+    /// reason this bug shipped twice: the 2026-08-18 heal had already written
+    /// the hub override, but never removed `bare = true` from the shared
+    /// config — so every linked worktree still inherited bare-ness while
+    /// `git worktree list` showed a perfectly healthy bare hub.
+    ///
+    /// The implementation of that heal returned early whenever the override was
+    /// already present, so it could never repair a hub it had itself
+    /// half-migrated: re-running it was a guaranteed no-op. Verified against
+    /// that revision (10c592e), this test fails with
+    /// `ensure_hub_bare_honored` returning `Ok(false)` and the worktree still
+    /// unusable.
+    ///
+    /// Note what is asserted: `git status` succeeding *inside a linked
+    /// worktree*. The 2026-08-18 test asserted the hub's porcelain `bare` flag
+    /// instead — a label that was already correct — which is exactly why it
+    /// passed while users kept hitting "must be run in a work tree".
+    #[test]
+    fn hub_bare_honored_heals_half_migrated_hub() {
+        let (tmp, hub, _main_wt) = scratch_hub();
+        tgit(&hub, &["config", "extensions.worktreeConfig", "true"]);
+        // The previous heal's output: override written, shared config untouched.
+        tgit(&hub, &["config", "--worktree", "core.bare", "true"]);
+        assert_eq!(shared_bare(&hub), Some(true), "shared `bare` still set");
+
+        let feat = tmp.path().join("feat");
+        tgit(
+            &hub,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                feat.to_str().unwrap(),
+                "-b",
+                "feat",
+            ],
+        );
+
+        assert!(
+            !worktree_status_ok(&feat),
+            "precondition: the half-migrated hub still breaks its worktrees — \
+             without this the test would pass against a hub that was never sick"
+        );
+
+        assert_eq!(
+            ensure_hub_bare_honored(&hub),
+            Ok(true),
+            "a half-migrated hub must still be healable, not skipped as done"
+        );
+
+        assert!(
+            worktree_status_ok(&feat),
+            "the user-facing symptom: `git status` must work in the worktree"
+        );
+        assert_eq!(shared_bare(&hub), None, "shared `bare` is gone");
+        assert!(is_bare_repository(&hub), "hub stays bare");
+    }
+
     #[test]
     fn hub_bare_honored_migration_is_idempotent() {
         let (tmp, hub, _main_wt) = scratch_hub();
