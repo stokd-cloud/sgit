@@ -293,7 +293,8 @@ pub fn resolve_rebase_conflicts(
     resolver: &dyn ConflictResolver,
 ) -> Result<(), String> {
     loop {
-        let name_only = run_git_captured(repo_root, &["diff", "--name-only", "--diff-filter=U"]);
+        let name_only =
+            run_git_captured(repo_root, &["diff", "--name-only", "--diff-filter=U"]);
         let files = parse_unmerged_paths(&name_only.stdout);
         if files.is_empty() {
             return Err(format!(
@@ -332,7 +333,8 @@ pub fn resolve_rebase_conflicts(
         match run_git_rebase_continue(repo_root) {
             Ok(()) => return Ok(()),
             Err(error) => {
-                let next = run_git_captured(repo_root, &["diff", "--name-only", "--diff-filter=U"]);
+                let next =
+                    run_git_captured(repo_root, &["diff", "--name-only", "--diff-filter=U"]);
                 if parse_unmerged_paths(&next.stdout).is_empty() {
                     return Err(error);
                 }
