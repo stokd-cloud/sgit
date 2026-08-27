@@ -285,48 +285,60 @@ fn backup_stamp() -> String {
 
 /// Parse unmerged paths, dispatch the resolver when real conflict markers are
 /// present, verify markers are gone, then `git add -A` + `git rebase --continue`.
+/// A rebase can stop once per conflicting commit, so continue resolving until
+/// Git either finishes the rebase or fails without another conflict round.
 pub fn resolve_rebase_conflicts(
     repo_root: &Path,
     branch: &str,
     resolver: &dyn ConflictResolver,
 ) -> Result<(), String> {
-    let name_only = run_git_captured(repo_root, &["diff", "--name-only", "--diff-filter=U"]);
-    let files = parse_unmerged_paths(&name_only.stdout);
-    if files.is_empty() {
-        return Ok(());
-    }
-    let has_markers = files.iter().any(|file| {
-        let content = std::fs::read_to_string(repo_root.join(file)).unwrap_or_default();
-        contains_conflict_markers(&content)
-    });
-    if !has_markers {
-        // No content markers — stage what the rebase produced and continue.
-        run_git(repo_root, &["add", "-A"])?;
-        run_git_rebase_continue(repo_root)?;
-        return Ok(());
-    }
-    println!(
-        "Rebase hit conflicts in {} file(s); invoking ConflictResolver...",
-        files.len()
-    );
-    resolver.resolve(&ConflictContext {
-        repo_root: repo_root.to_path_buf(),
-        branch: branch.to_string(),
-        unmerged_files: files.clone(),
-        kind: ConflictKind::Rebase,
-    })?;
-
-    for file in &files {
-        let content = std::fs::read_to_string(repo_root.join(file)).unwrap_or_default();
-        if contains_conflict_markers(&content) {
+    loop {
+        let name_only = run_git_captured(repo_root, &["diff", "--name-only", "--diff-filter=U"]);
+        let files = parse_unmerged_paths(&name_only.stdout);
+        if files.is_empty() {
             return Err(format!(
-                "conflict markers still present in {file} after resolution; the rebase is left in place so both sides are preserved"
+                "git rebase origin/{branch} failed without leaving unmerged paths; the rebase is left in place so both sides are preserved"
             ));
         }
+        let has_markers = files.iter().any(|file| {
+            let content = std::fs::read_to_string(repo_root.join(file)).unwrap_or_default();
+            contains_conflict_markers(&content)
+        });
+        if has_markers {
+            println!(
+                "Rebase hit conflicts in {} file(s); invoking ConflictResolver...",
+                files.len()
+            );
+            resolver.resolve(&ConflictContext {
+                repo_root: repo_root.to_path_buf(),
+                branch: branch.to_string(),
+                unmerged_files: files.clone(),
+                kind: ConflictKind::Rebase,
+            })?;
+
+            for file in &files {
+                let content = std::fs::read_to_string(repo_root.join(file)).unwrap_or_default();
+                if contains_conflict_markers(&content) {
+                    return Err(format!(
+                        "conflict markers still present in {file} after resolution; the rebase is left in place so both sides are preserved"
+                    ));
+                }
+            }
+        }
+
+        // Marker-less conflicts are structural; preserve the existing behavior
+        // of staging the state Git/resolver produced before continuing.
+        run_git(repo_root, &["add", "-A"])?;
+        match run_git_rebase_continue(repo_root) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let next = run_git_captured(repo_root, &["diff", "--name-only", "--diff-filter=U"]);
+                if parse_unmerged_paths(&next.stdout).is_empty() {
+                    return Err(error);
+                }
+            }
+        }
     }
-    run_git(repo_root, &["add", "-A"])?;
-    run_git_rebase_continue(repo_root)?;
-    Ok(())
 }
 
 // ── Unmerged index stages (modify/delete-safe conflict handling) ─────────────
@@ -725,7 +737,7 @@ pub fn detect_branch_at(path: &Path) -> Option<String> {
 
     let branch = String::from_utf8(output.stdout).ok()?;
     let branch = branch.trim();
-    if branch.is_empty() {
+    if branch.is_empty() || branch == "HEAD" {
         None
     } else {
         Some(branch.to_string())
@@ -1747,6 +1759,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn detect_branch_rejects_detached_head() {
+        let repo = initialized_test_repo();
+        assert!(detect_branch_at(repo.path()).is_some());
+
+        git_test(repo.path(), &["checkout", "--detach"]);
+
+        assert_eq!(detect_branch_at(repo.path()), None);
+    }
+
     struct NoopResolver;
     impl ConflictResolver for NoopResolver {
         fn resolve(&self, _ctx: &ConflictContext) -> Result<(), String> {
@@ -1762,6 +1784,96 @@ mod tests {
             .output()
             .expect("run git");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    struct CountingResolver {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ConflictResolver for CountingResolver {
+        fn resolve(&self, ctx: &ConflictContext) -> Result<(), String> {
+            let round = self.calls.get() + 1;
+            self.calls.set(round);
+            for file in &ctx.unmerged_files {
+                write_test_file(
+                    &ctx.repo_root,
+                    file,
+                    &format!("resolved conflict round {round}\n"),
+                );
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn push_resolves_every_conflicting_commit_in_a_rebase() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        git_test(&seed, &["init", "-q", "-b", "main"]);
+        git_test(&seed, &["config", "user.name", "Shove Test"]);
+        git_test(&seed, &["config", "user.email", "shove-test@example.com"]);
+        write_test_file(&seed, "first.txt", "base first\n");
+        write_test_file(&seed, "second.txt", "base second\n");
+        git_test(&seed, &["add", "."]);
+        git_test(&seed, &["commit", "-q", "-m", "base"]);
+
+        let remote = tmp.path().join("remote.git");
+        git_test(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().unwrap(),
+                remote.to_str().unwrap(),
+            ],
+        );
+        let local = tmp.path().join("local");
+        let peer = tmp.path().join("peer");
+        for checkout in [&local, &peer] {
+            git_test(
+                tmp.path(),
+                &[
+                    "clone",
+                    "-q",
+                    remote.to_str().unwrap(),
+                    checkout.to_str().unwrap(),
+                ],
+            );
+            git_test(checkout, &["config", "user.name", "Shove Test"]);
+            git_test(
+                checkout,
+                &["config", "user.email", "shove-test@example.com"],
+            );
+        }
+
+        write_test_file(&local, "first.txt", "local first\n");
+        git_test(&local, &["add", "first.txt"]);
+        git_test(&local, &["commit", "-q", "-m", "local first"]);
+        write_test_file(&local, "second.txt", "local second\n");
+        git_test(&local, &["add", "second.txt"]);
+        git_test(&local, &["commit", "-q", "-m", "local second"]);
+
+        write_test_file(&peer, "first.txt", "remote first\n");
+        write_test_file(&peer, "second.txt", "remote second\n");
+        git_test(&peer, &["add", "."]);
+        git_test(&peer, &["commit", "-q", "-m", "remote both"]);
+        git_test(&peer, &["push", "-q", "origin", "main"]);
+
+        let resolver = CountingResolver {
+            calls: std::cell::Cell::new(0),
+        };
+        push_with_sync(&local, "main", &resolver)
+            .expect("all sequential rebase conflicts should resolve and push");
+
+        assert_eq!(resolver.calls.get(), 2);
+        assert_eq!(
+            rev_parse(&local, "HEAD"),
+            rev_parse(&remote, "refs/heads/main")
+        );
+        assert!(!local.join(".git/rebase-merge").exists());
+        assert!(!local.join(".git/rebase-apply").exists());
     }
 
     /// AX-SGIT-BRANCH-UPSTREAM-SELF (push half): a push must name its
