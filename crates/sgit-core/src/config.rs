@@ -43,15 +43,26 @@ pub struct RepositoriesConfig {
     pub submodule_checkout: SubmoduleCheckoutConfig,
 }
 
-impl Default for RepositoriesConfig {
-    fn default() -> Self {
+impl RepositoriesConfig {
+    /// Defaults for an explicitly-supplied environment
+    /// (AX-REPO-REPO-ROOTS-PRIVILEGE-FREE-AND-PARITY). `Default` is this with
+    /// the real environment probed; tests take this seam so they never depend
+    /// on the developer's `$HOME` or on whether `/opt` happens to exist.
+    pub fn default_with_root_env(env: &crate::roots::RootEnv) -> Self {
+        let roots = crate::roots::resolve_root_defaults(env);
         Self {
-            bare_root: "/opt/dev".to_string(),
-            worktree_root: "/opt/worktrees".to_string(),
+            bare_root: roots.bare_root,
+            worktree_root: roots.worktree_root,
             main_worktree_name: "{branch}".to_string(),
             track_non_git_workspaces: false,
             submodule_checkout: SubmoduleCheckoutConfig::default(),
         }
+    }
+}
+
+impl Default for RepositoriesConfig {
+    fn default() -> Self {
+        Self::default_with_root_env(&crate::roots::probe_root_env())
     }
 }
 

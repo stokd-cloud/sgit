@@ -13,6 +13,7 @@ pub mod migrate_ops;
 pub mod pull;
 mod repo_list;
 mod repo_ref;
+pub mod roots;
 pub mod shove;
 pub mod submodule_checkout;
 pub mod worktree_clean;
@@ -33,6 +34,11 @@ pub use checkout::{
 };
 pub use config::{
     load_repositories_config, resolve_config_path, ConfigSource, RepositoriesConfig,
+};
+pub use roots::{
+    default_bare_root, default_worktree_root, is_usable_root, probe_root_env,
+    resolve_root_defaults, RootDefaults, RootEnv, HOME_BARE_DIRNAME, HOME_WORKTREE_DIRNAME,
+    LEGACY_BARE_ROOT, LEGACY_WORKTREE_ROOT,
 };
 pub use submodule_checkout::{
     apply_submodule_checkout, apply_submodule_checkout_for_repo, normalize_repo_key,
