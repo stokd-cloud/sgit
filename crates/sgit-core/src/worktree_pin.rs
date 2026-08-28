@@ -73,45 +73,35 @@ fn current_branch_ref(path: &Path) -> Option<String> {
     git_out(path, &["symbolic-ref", "HEAD"])
 }
 
-/// True when `ref_name` resolves to an existing ref in the repo at `path`.
-fn ref_exists(path: &Path, ref_name: &str) -> bool {
-    git_out(path, &["rev-parse", "--verify", "--quiet", ref_name]).is_some()
+/// The existing pin marker's ref for the worktree at `path`, if present and
+/// non-empty.
+fn existing_pin_ref(path: &Path) -> Option<String> {
+    let marker = pin_marker_path(path)?;
+    let content = std::fs::read_to_string(marker).ok()?;
+    let first = content.lines().next()?.trim().to_string();
+    if first.is_empty() {
+        None
+    } else {
+        Some(first)
+    }
 }
 
-/// The branch ref a worktree should be pinned to. Resolved in order:
-///   1. the current branch (attached HEAD), else
-///   2. the branch checked out immediately before a detach (`@{-1}`), if it still
-///      exists, else
-///   3. the repo's configured default branch (`stokd.defaultBranch`), if it exists.
+/// Pin the linked worktree at `path` to its branch.
 ///
-/// `None` only when none of these can be resolved — pinning is then a no-op.
-fn intended_pin_ref(path: &Path) -> Option<String> {
-    if let Some(current) = current_branch_ref(path) {
-        return Some(current);
-    }
-    if let Some(prev) = git_out(path, &["rev-parse", "--symbolic-full-name", "@{-1}"]) {
-        if prev.starts_with("refs/heads/") && ref_exists(path, &prev) {
-            return Some(prev);
-        }
-    }
-    if let Some(default) = git_out(path, &["config", "--get", "stokd.defaultBranch"]) {
-        let full = format!("refs/heads/{default}");
-        if ref_exists(path, &full) {
-            return Some(full);
-        }
-    }
-    None
-}
-
-/// Pin the linked worktree at `path` to its intended branch.
-/// Returns Ok(false) (no-op) for a non-linked worktree or when no branch can be
-/// inferred; Ok(true) when the marker is present and current afterward.
+/// A pin records TRUTH, never a guess (the 2026-08-28 incident: a guessed
+/// `stokd.defaultBranch` pin overwrote a mid-rebase task worktree's marker
+/// with `main`, and the hook then refused reattaching the worktree to its
+/// real branch). Resolution:
+///   * attached HEAD → the current branch is the truth; write it.
+///   * detached with an existing marker → the marker stays authoritative,
+///     byte-untouched.
+///   * detached without a marker → nothing to pin; Ok(false).
 pub fn write_pin_marker(path: &Path) -> std::io::Result<bool> {
     let Some(marker) = pin_marker_path(path) else {
         return Ok(false);
     };
-    let Some(branch_ref) = intended_pin_ref(path) else {
-        return Ok(false);
+    let Some(branch_ref) = current_branch_ref(path) else {
+        return Ok(existing_pin_ref(path).is_some());
     };
     let already = std::fs::read_to_string(&marker)
         .ok()
@@ -169,7 +159,65 @@ pub fn list_worktree_paths(anchor: &Path) -> Vec<PathBuf> {
 pub struct ReconcileResult {
     pub pinned: Vec<PathBuf>,
     pub unpinned: Vec<PathBuf>,
+    /// Detached worktrees safely returned to their pinned branch.
+    pub reattached: Vec<PathBuf>,
     pub skipped: Vec<(PathBuf, String)>,
+}
+
+/// True when the worktree at `path` has a git operation in progress (rebase,
+/// bisect, merge, cherry-pick, revert) — reconcile must not touch it.
+fn op_in_progress(path: &Path) -> bool {
+    let Some(gd) = worktree_git_dir(path) else {
+        return false;
+    };
+    [
+        "rebase-merge",
+        "rebase-apply",
+        "BISECT_LOG",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+    ]
+    .iter()
+    .any(|f| gd.join(f).exists())
+}
+
+/// Reattach a cleanly detached pinned worktree to its marker branch.
+///
+/// Safe only when no operation is in progress, the marker branch exists, and
+/// the detached HEAD sits exactly at the branch tip — then `git symbolic-ref
+/// HEAD <marker>` changes nothing but attachment, and the pin hook allows it
+/// (a move TO the pinned branch). Returns a skip reason when not applicable.
+fn try_reattach(path: &Path, marker_ref: &str) -> Result<(), String> {
+    if op_in_progress(path) {
+        return Err("detached: operation in progress (rebase/bisect/merge)".into());
+    }
+    let Some(branch_tip) = git_out(path, &["rev-parse", "--verify", "--quiet", marker_ref]) else {
+        return Err(format!("detached: pinned branch {marker_ref} does not exist"));
+    };
+    let Some(head_oid) = git_out(path, &["rev-parse", "--verify", "--quiet", "HEAD"]) else {
+        return Err("detached: HEAD does not resolve".into());
+    };
+    if head_oid != branch_tip {
+        return Err(format!(
+            "detached at {} but {marker_ref} is at {} — not reattaching (commits would be hidden or lost)",
+            &head_oid[..head_oid.len().min(8)],
+            &branch_tip[..branch_tip.len().min(8)],
+        ));
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["symbolic-ref", "HEAD", marker_ref])
+        .output()
+        .map_err(|e| format!("failed to run git symbolic-ref: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "reattach refused: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 /// (Un)pin every linked worktree of the repo `anchor` belongs to.
@@ -185,15 +233,91 @@ pub fn reconcile(anchor: &Path, off: bool) -> ReconcileResult {
                 Ok(_) => r.unpinned.push(wt),
                 Err(e) => r.skipped.push((wt, e.to_string())),
             }
-        } else {
-            match write_pin_marker(&wt) {
-                Ok(true) => r.pinned.push(wt),
-                Ok(false) => r.skipped.push((wt, "no branch to infer for pinning".into())),
-                Err(e) => r.skipped.push((wt, e.to_string())),
+            continue;
+        }
+        if current_branch_ref(&wt).is_none() {
+            // Detached: markers are never guessed here. With an existing
+            // marker, heal by reattaching when provably safe; otherwise
+            // leave the worktree exactly as found.
+            match existing_pin_ref(&wt) {
+                Some(marker_ref) => match try_reattach(&wt, &marker_ref) {
+                    Ok(()) => r.reattached.push(wt),
+                    Err(why) => r.skipped.push((wt, why)),
+                },
+                None => r
+                    .skipped
+                    .push((wt, "detached with no pin; nothing to enforce".into())),
             }
+            continue;
+        }
+        match write_pin_marker(&wt) {
+            Ok(true) => r.pinned.push(wt),
+            Ok(false) => r.skipped.push((wt, "no branch to infer for pinning".into())),
+            Err(e) => r.skipped.push((wt, e.to_string())),
         }
     }
     r
+}
+
+/// Read-only pin audit state for one worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinState {
+    /// Attached to the branch its marker names.
+    AttachedOk,
+    /// Attached to a branch that differs from its marker.
+    AttachedMismatch { on: String },
+    /// Detached mid-operation (rebase/bisect/merge); reconcile must wait.
+    DetachedBusy,
+    /// Detached exactly at the marker branch tip; `pin` would reattach it.
+    DetachedHealable,
+    /// Detached away from the marker branch tip (or the branch is gone);
+    /// needs a human decision.
+    DetachedStuck,
+    /// No pin marker.
+    Unpinned,
+}
+
+/// One row of `pin_status`.
+#[derive(Debug, Clone)]
+pub struct PinStatusRow {
+    pub path: PathBuf,
+    pub marker: Option<String>,
+    pub state: PinState,
+}
+
+/// Read-only audit of every linked worktree of the repo `anchor` belongs to.
+/// Classifies each against its pin marker; mutates nothing.
+pub fn pin_status(anchor: &Path) -> Vec<PinStatusRow> {
+    let mut rows = Vec::new();
+    for wt in list_worktree_paths(anchor) {
+        if !is_linked_worktree(&wt) {
+            continue;
+        }
+        let marker = existing_pin_ref(&wt);
+        let state = match (&marker, current_branch_ref(&wt)) {
+            (None, _) => PinState::Unpinned,
+            (Some(m), Some(on)) if *m == on => PinState::AttachedOk,
+            (Some(_), Some(on)) => PinState::AttachedMismatch { on },
+            (Some(m), None) => {
+                if op_in_progress(&wt) {
+                    PinState::DetachedBusy
+                } else {
+                    let tip = git_out(&wt, &["rev-parse", "--verify", "--quiet", m]);
+                    let head = git_out(&wt, &["rev-parse", "--verify", "--quiet", "HEAD"]);
+                    match (tip, head) {
+                        (Some(t), Some(h)) if t == h => PinState::DetachedHealable,
+                        _ => PinState::DetachedStuck,
+                    }
+                }
+            }
+        };
+        rows.push(PinStatusRow {
+            path: wt,
+            marker,
+            state,
+        });
+    }
+    rows
 }
 
 /// Discover bare repos (`*.git` directories) under `bare_root`.
@@ -613,59 +737,126 @@ mod tests {
     }
 
     #[test]
-    fn write_pin_marker_pins_detached_worktree_to_last_branch() {
-        let (_tmp, _primary, wt) = scratch_repo();
+    fn write_pin_marker_does_not_guess_on_detached() {
+        let (_tmp, primary, wt) = scratch_repo();
+        git(&primary, &["config", "stokd.defaultBranch", "main"]);
         git(&wt, &["checkout", "--detach", "-q"]);
         assert!(
             current_branch_ref(&wt).is_none(),
             "worktree should be on a detached HEAD for this test"
         );
         assert!(
-            write_pin_marker(&wt).unwrap(),
-            "a detached linked worktree must still be pinnable"
+            !write_pin_marker(&wt).unwrap(),
+            "a detached worktree without a marker has no branch truth: never \
+             write a guessed pin (incident 2026-08-28: a defaultBranch guess \
+             repinned a task worktree to main and the hook then enforced it)"
         );
-        assert_eq!(
-            std::fs::read_to_string(pin_marker_path(&wt).unwrap())
-                .unwrap()
-                .trim(),
-            "refs/heads/pinned",
-        );
-    }
-
-    #[test]
-    fn reconcile_pins_detached_worktree() {
-        let (_tmp, _primary, wt) = scratch_repo();
-        git(&wt, &["checkout", "--detach", "-q"]);
-        let r = reconcile(&wt, false);
-        assert_eq!(
-            r.pinned.len(),
-            1,
-            "detached linked worktree must be pinned, not skipped: {:?}",
-            r.skipped
-        );
-        assert_eq!(
-            std::fs::read_to_string(pin_marker_path(&wt).unwrap())
-                .unwrap()
-                .trim(),
-            "refs/heads/pinned",
+        assert!(
+            !pin_marker_path(&wt).unwrap().exists(),
+            "no guessed marker may be written"
         );
     }
 
+    /// A pin marker, once present, is authoritative: nothing may replace it
+    /// with a guessed branch, no matter how the guess tiers resolve.
     #[test]
-    fn write_pin_marker_falls_back_to_default_branch_when_last_branch_gone() {
+    fn write_pin_marker_never_overwrites_existing_marker() {
         let (_tmp, primary, wt) = scratch_repo();
         git(&primary, &["config", "stokd.defaultBranch", "main"]);
+        let marker = pin_marker_path(&wt).expect("marker path");
+        std::fs::write(&marker, "refs/heads/pinned\n").unwrap();
         git(&wt, &["checkout", "--detach", "-q"]);
+        // The incident shape: the marker's branch is gone from the guessable
+        // set, and every fallback tier resolves to the WRONG branch.
         git(&primary, &["branch", "-D", "pinned"]);
+        write_pin_marker(&wt).expect("write_pin_marker runs");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            "refs/heads/pinned",
+            "an existing marker must never be replaced by a guess"
+        );
+    }
+
+    /// Reconcile heals a cleanly detached pinned worktree (detached exactly at
+    /// its pinned branch tip, no operation in progress) by reattaching HEAD —
+    /// through the live hook, which must allow moves TO the pinned branch.
+    #[test]
+    fn reconcile_reattaches_cleanly_detached_pinned_worktree() {
+        let (_tmp, _primary, wt) = scratch_repo();
+        assert!(write_pin_marker(&wt).unwrap(), "attached pin succeeds");
+        git(&wt, &["checkout", "--detach", "-q"]);
+        let r = ensure_pin_and_hook(&wt, false).expect("pin runs");
         assert!(
-            write_pin_marker(&wt).unwrap(),
-            "must pin to the default branch when the last branch is gone"
+            r.reattached.iter().any(|p| p.ends_with("wt")),
+            "cleanly detached pinned worktree must be reattached: {r:?}"
+        );
+        assert_eq!(head_symref(&wt), "refs/heads/pinned");
+    }
+
+    /// A worktree detached by an in-progress operation (conflicted rebase) is
+    /// out of bounds for reconcile: marker byte-identical, HEAD untouched.
+    #[test]
+    fn reconcile_leaves_mid_rebase_worktree_alone() {
+        let (_tmp, primary, wt) = scratch_repo();
+        assert!(write_pin_marker(&wt).unwrap());
+        std::fs::write(primary.join("f.txt"), "main\n").unwrap();
+        git(&primary, &["add", "f.txt"]);
+        git(&primary, &["commit", "-q", "-m", "main f"]);
+        std::fs::write(wt.join("f.txt"), "pinned\n").unwrap();
+        git(&wt, &["add", "f.txt"]);
+        git(&wt, &["commit", "-q", "-m", "pinned f"]);
+        let (ok, _e) = git_try(&wt, &["rebase", "main"]);
+        assert!(!ok, "rebase must stop on conflict");
+        let marker = pin_marker_path(&wt).unwrap();
+        let before = std::fs::read_to_string(&marker).unwrap();
+        let r = ensure_pin_and_hook(&wt, false).expect("pin runs");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            before,
+            "mid-rebase marker must be untouched"
         );
         assert_eq!(
-            std::fs::read_to_string(pin_marker_path(&wt).unwrap())
-                .unwrap()
-                .trim(),
-            "refs/heads/main",
+            head_symref(&wt),
+            "<detached>",
+            "mid-rebase worktree must stay detached: {r:?}"
+        );
+    }
+
+    /// `pin_status` is a read-only audit: it classifies every worktree without
+    /// mutating markers or HEADs.
+    #[test]
+    fn pin_status_classifies_worktree_states() {
+        let (tmp, primary, wt) = scratch_repo();
+        assert!(write_pin_marker(&wt).unwrap()); // attached-ok
+        let det = tmp.path().join("det");
+        git(
+            &primary,
+            &["worktree", "add", "--detach", "-q", det.to_str().unwrap()],
+        );
+        let det_marker = pin_marker_path(&det).unwrap();
+        std::fs::write(&det_marker, "refs/heads/pinned\n").unwrap(); // healable? det HEAD == main tip, pinned tip differs unless equal — classify by oid
+        let rows = pin_status(&wt);
+        let find = |suffix: &str| {
+            rows.iter()
+                .find(|r| r.path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("no status row for {suffix}: {rows:?}"))
+        };
+        assert!(
+            matches!(find("wt").state, PinState::AttachedOk),
+            "pinned attached worktree is ok: {rows:?}"
+        );
+        assert!(
+            matches!(
+                find("det").state,
+                PinState::DetachedHealable | PinState::DetachedStuck
+            ),
+            "detached worktree with marker is detached-classified: {rows:?}"
+        );
+        // Read-only: nothing changed.
+        assert_eq!(head_symref(&det), "<detached>");
+        assert_eq!(
+            std::fs::read_to_string(&det_marker).unwrap().trim(),
+            "refs/heads/pinned"
         );
     }
 
