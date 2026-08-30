@@ -27,6 +27,14 @@ jobs:
       - name: Build
         run: cargo build -p sgit -p sgit-core
 
+      # Tests that commit into fixtures need an identity. Actions runners
+      # have none, which is why apply_divergent_cluster_falls_back_to_suffix
+      # has been red on main.
+      - name: Git identity for tests
+        run: |
+          git config --global user.email "ci@sgit.selfactor.io"
+          git config --global user.name "sgit-ci"
+
       - name: Test
         run: cargo test --workspace
 
