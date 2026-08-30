@@ -516,10 +516,10 @@ pub fn stage_conflict_resolution(
         match stage_action_for(path_present(repo_root, &entry.path)) {
             StageAction::Add => run_git(repo_root, &["add", "--", &entry.path])?,
             StageAction::Remove => {
-                let removed = run_git_captured(repo_root, &["rm", "-f", "--", &entry.path]);
-                if !removed.success {
-                    run_git(repo_root, &["rm", "--cached", "-f", "--", &entry.path])?;
-                }
+                run_git(
+                    repo_root,
+                    &["update-index", "--force-remove", "--", &entry.path],
+                )?;
             }
         }
     }
@@ -1527,6 +1527,21 @@ mod tests {
         assert!(conflict_round_needs_resolver(&text, true));
         assert!(conflict_round_needs_resolver(&structural, false));
         assert_eq!(stage_action_for(false), StageAction::Remove);
+    }
+
+    #[test]
+    fn stage_conflict_resolution_accepts_an_already_staged_deletion() {
+        let repo = initialized_test_repo();
+        std::fs::remove_file(repo.path().join("README.md")).expect("remove tracked file");
+        git_test(repo.path(), &["add", "-u", "--", "README.md"]);
+
+        let entries = vec![UnmergedEntry {
+            path: "README.md".into(),
+            kind: UnmergedKind::DeletedByUs,
+        }];
+
+        stage_conflict_resolution(repo.path(), &entries)
+            .expect("re-staging an already staged deletion is idempotent");
     }
 
     #[test]
