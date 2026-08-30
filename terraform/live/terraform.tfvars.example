@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars (gitignored) or pass the same values as TF_VAR_* /
+# scripts/done.sh environment variables.
+#
+# hosted_zone_id is the existing selfactor.io zone in the SST account.
+# Do not create a second hosted zone for selfactor.io.
+
+hosted_zone_id = "ZXXXXXXXXXXXXXX"
+domain_name    = "sgit.selfactor.io"
+environment    = "prod"
+aws_region     = "us-east-1"
+
+# Optional: fail apply if credentials are for a different account.
+# aws_account_id = "123456789012"

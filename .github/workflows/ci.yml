@@ -29,3 +29,29 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  terraform:
+    name: terraform fmt & validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Format
+        run: terraform fmt -check -recursive terraform
+
+      - name: Validate
+        run: |
+          terraform -chdir=terraform/live init -backend=false -input=false
+          terraform -chdir=terraform/live validate
+
+      - name: Scripts
+        run: |
+          bash -n scripts/done.sh
+          bash -n scripts/build-site.sh
+          bash scripts/build-site.sh
