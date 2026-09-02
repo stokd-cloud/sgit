@@ -671,6 +671,35 @@ struct RenamePlan {
     bare_to: PathBuf,
     new_origin_url: String,
     worktree_moves: Vec<(PathBuf, PathBuf)>,
+    /// Entries parked under the old worktree prefix that git does not know as
+    /// linked worktrees of the bare (typically standalone full clones). They
+    /// still name the old owner/repo after the move, so they travel too.
+    stray_moves: Vec<(PathBuf, PathBuf)>,
+    /// `<worktreeRoot>/<oldOwner>/<oldRepo>` — pruned when it ends up empty.
+    old_worktree_prefix: PathBuf,
+}
+
+/// Repo-config keys whose value is a hook directory that may live inside the
+/// bare being relocated. A dangling `core.hooksPath` is silently "no hooks" in
+/// git, so both must be carried across a rename.
+const HOOK_PATH_KEYS: [&str; 2] = ["core.hooksPath", "stokd.hooks.priorHooksPath"];
+
+/// Remap an absolute path that lives inside `from` onto `to`, preserving the
+/// relative suffix. `None` when `configured` is not under `from`, so a husky- or
+/// third-party-owned hooks directory is never rewritten.
+fn remap_under_relocated_dir(configured: &str, from: &Path, to: &Path) -> Option<String> {
+    let path = Path::new(configured);
+    if !path.is_absolute() {
+        return None;
+    }
+    // Component-wise, so a sibling like `<bare>.bak` is never treated as inside.
+    let rest = path.strip_prefix(from).ok()?;
+    let mapped = if rest.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(rest)
+    };
+    Some(mapped.to_string_lossy().into_owned())
 }
 
 fn plan_repo_rename(
@@ -680,6 +709,7 @@ fn plan_repo_rename(
     new_owner: &str,
     new_repo: &str,
     worktree_paths: &[PathBuf],
+    stray_entries: &[PathBuf],
 ) -> RenamePlan {
     let old_layout = resolve_repo_layout(cfg, old_owner, old_repo);
     let new_layout = resolve_repo_layout(cfg, new_owner, new_repo);
@@ -701,6 +731,24 @@ fn plan_repo_rename(
         })
         .collect();
 
+    // Anything parked under the old prefix that git does not know as a linked
+    // worktree still names the old owner/repo after the move, so it travels too.
+    let registered: Vec<PathBuf> = worktree_paths.iter().map(|p| normalize_path(p)).collect();
+    let stray_moves: Vec<(PathBuf, PathBuf)> = stray_entries
+        .iter()
+        .filter(|entry| {
+            let entry_n = normalize_path(entry);
+            !registered.contains(&entry_n)
+        })
+        .filter_map(|from| {
+            let from_n = normalize_path(from);
+            from_n
+                .strip_prefix(&old_prefix)
+                .ok()
+                .map(|rest| (from.clone(), new_prefix.join(rest)))
+        })
+        .collect();
+
     RenamePlan {
         gh_rename: new_repo != old_repo,
         gh_transfer: new_owner != old_owner,
@@ -708,7 +756,36 @@ fn plan_repo_rename(
         bare_to: new_layout.bare_dir,
         new_origin_url: format!("git@github.com:{new_owner}/{new_repo}.git"),
         worktree_moves,
+        stray_moves,
+        old_worktree_prefix: old_prefix,
     }
+}
+
+/// Direct children of `prefix` (the old `<worktreeRoot>/<owner>/<repo>` dir).
+/// Missing or unreadable prefix -> empty, so a repo with no worktree tree at all
+/// plans exactly as it did before.
+fn list_prefix_entries(prefix: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = match fs::read_dir(prefix) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
+        Err(_) => return Vec::new(),
+    };
+    out.sort();
+    out
+}
+
+/// Read one repo-config value, or `None` when unset/empty.
+fn git_config_value(dir: &Path, key: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 fn transfer_blocked_needs_mirror_fallback(detail: &str) -> bool {
@@ -817,14 +894,35 @@ pub fn run_rename_local_layout_only(
         }
         list_linked_worktrees(&old_layout.bare_dir)
     };
-    let plan = plan_repo_rename(cfg, old_owner, old_repo, new_owner, new_repo, &worktrees);
+    let strays = list_prefix_entries(
+        &normalize_path(Path::new(&cfg.worktree_root))
+            .join(old_owner)
+            .join(old_repo),
+    );
+    let plan = plan_repo_rename(
+        cfg, old_owner, old_repo, new_owner, new_repo, &worktrees, &strays,
+    );
     if plan.bare_to.exists() {
         die(format!(
             "destination bare clone already exists: {}",
             plan.bare_to.display()
         ));
     }
+    preflight_stray_destinations(&plan);
     apply_local_rename(&plan, old_owner, old_repo, new_owner, new_repo);
+}
+
+/// Fail before any mutation when a stray's destination is already occupied.
+fn preflight_stray_destinations(plan: &RenamePlan) {
+    for (from, to) in &plan.stray_moves {
+        if to.exists() {
+            die(format!(
+                "cannot relocate {}: destination already exists: {}",
+                from.display(),
+                to.display()
+            ));
+        }
+    }
 }
 
 fn apply_local_rename(
@@ -840,6 +938,11 @@ fn apply_local_rename(
     )
     .unwrap_or_else(|e| die(e));
     println!("Pointed origin at {}", plan.new_origin_url);
+
+    // Snapshot hook wiring while the bare is still readable at its old path.
+    // git treats a dangling `core.hooksPath` as "no hooks" — silently — so the
+    // pointer has to be rewritten as part of the move, not left to be noticed.
+    let hook_remaps = plan_hook_remaps(&plan.bare_from, &plan.bare_from, &plan.bare_to);
 
     let mut repair_targets = Vec::new();
     for (from, to) in &plan.worktree_moves {
@@ -874,10 +977,115 @@ fn apply_local_rename(
         other => die(format!("bare relocation failed: {other:?}")),
     }
 
+    apply_hook_remaps(&plan.bare_to, &hook_remaps);
+
+    for (from, to) in &plan.stray_moves {
+        println!("Moving stray clone {} -> {}", from.display(), to.display());
+        if let Err(e) = move_plain_dir(from, to) {
+            die(format!("stray relocation failed: {e}"));
+        }
+        adopt_relocated_stray(to, plan, old_owner, old_repo);
+    }
+    prune_empty_prefix(&plan.old_worktree_prefix);
+
     println!("\nRenamed {old_owner}/{old_repo} -> {new_owner}/{new_repo}.");
     println!("  Bare clone: {}", plan.bare_to.display());
     for (_, to) in &plan.worktree_moves {
         println!("  Worktree:   {}", to.display());
+    }
+    for (_, to) in &plan.stray_moves {
+        println!("  Clone:      {}", to.display());
+    }
+}
+
+/// Read the hook-path config from `read_from` and remap any value that lives
+/// inside `from` onto `to`. Values outside `from` (husky, another manager) are
+/// left untouched by design.
+fn plan_hook_remaps(read_from: &Path, from: &Path, to: &Path) -> Vec<(&'static str, String)> {
+    HOOK_PATH_KEYS
+        .iter()
+        .filter_map(|key| {
+            let current = git_config_value(read_from, key)?;
+            let remapped = remap_under_relocated_dir(&current, from, to)?;
+            Some((*key, remapped))
+        })
+        .collect()
+}
+
+fn apply_hook_remaps(dir: &Path, remaps: &[(&'static str, String)]) {
+    for (key, value) in remaps {
+        match run_git_dir(dir, &["config", key, value]) {
+            Ok(()) => println!("Repointed {key} at {value}"),
+            Err(e) => eprintln!("  warning: could not repoint {key}: {e}"),
+        }
+    }
+}
+
+/// Move a directory that git does not track as a worktree. Same-volume renames
+/// are atomic; a cross-device refusal is reported rather than half-copied.
+fn move_plain_dir(from: &Path, to: &Path) -> Result<(), String> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    fs::rename(from, to)
+        .map_err(|e| format!("cannot move {} -> {}: {e}", from.display(), to.display()))
+}
+
+/// Re-point a relocated standalone clone at the renamed repo: its `origin` (the
+/// old URL survives only on GitHub's non-permanent redirect) and any hook dir it
+/// borrowed from the old bare.
+fn adopt_relocated_stray(clone_dir: &Path, plan: &RenamePlan, old_owner: &str, old_repo: &str) {
+    if !clone_dir.join(".git").exists() {
+        eprintln!(
+            "  warning: {} is not a git clone — relocated as-is",
+            clone_dir.display()
+        );
+        return;
+    }
+    if let Some(url) = git_config_value(clone_dir, "remote.origin.url") {
+        if url_names_repo(&url, old_owner, old_repo) {
+            match run_git_dir(
+                clone_dir,
+                &["remote", "set-url", "origin", &plan.new_origin_url],
+            ) {
+                Ok(()) => println!("  Pointed origin at {}", plan.new_origin_url),
+                Err(e) => eprintln!("  warning: could not repoint origin: {e}"),
+            }
+        }
+    }
+    let remaps = plan_hook_remaps(clone_dir, &plan.bare_from, &plan.bare_to);
+    apply_hook_remaps(clone_dir, &remaps);
+    eprintln!(
+        "  warning: {} is a standalone clone, not a linked worktree of {}. Run `sgit repo migrate` to consolidate it.",
+        clone_dir.display(),
+        plan.bare_to.display()
+    );
+}
+
+/// True when `url` addresses `owner/repo` (ssh or https, with or without `.git`).
+fn url_names_repo(url: &str, owner: &str, repo: &str) -> bool {
+    let needle = format!("{owner}/{repo}").to_ascii_lowercase();
+    url.trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_ascii_lowercase()
+        .ends_with(&needle)
+}
+
+/// Remove the old `<owner>/<repo>` prefix (and a then-empty owner dir) only when
+/// empty — never recursively.
+fn prune_empty_prefix(prefix: &Path) {
+    if fs::remove_dir(prefix).is_err() {
+        if prefix.exists() {
+            eprintln!(
+                "  warning: {} still holds entries and was left in place",
+                prefix.display()
+            );
+        }
+        return;
+    }
+    if let Some(owner_dir) = prefix.parent() {
+        let _ = fs::remove_dir(owner_dir);
     }
 }
 
@@ -901,7 +1109,14 @@ pub fn run_rename(repo_spec: &str, new_repo_spec: &str) {
         list_linked_worktrees(&old_layout.bare_dir)
     };
 
-    let plan = plan_repo_rename(&cfg, &old_owner, &old_repo, &new_owner, &new_repo, &worktrees);
+    let strays = list_prefix_entries(
+        &normalize_path(Path::new(&cfg.worktree_root))
+            .join(&old_owner)
+            .join(&old_repo),
+    );
+    let plan = plan_repo_rename(
+        &cfg, &old_owner, &old_repo, &new_owner, &new_repo, &worktrees, &strays,
+    );
 
     if plan.bare_to.exists() {
         die(format!(
@@ -909,6 +1124,8 @@ pub fn run_rename(repo_spec: &str, new_repo_spec: &str) {
             plan.bare_to.display()
         ));
     }
+    // Collisions are fatal BEFORE any GitHub or filesystem mutation.
+    preflight_stray_destinations(&plan);
 
     let mut did_mirror_fallback = false;
     if plan.gh_transfer {
@@ -1080,7 +1297,7 @@ mod tests {
             PathBuf::from("/opt/worktrees/a/r/main"),
             PathBuf::from("/opt/worktrees/a/r/feat"),
         ];
-        let plan = plan_repo_rename(&cfg, "a", "r", "b", "s", &wts);
+        let plan = plan_repo_rename(&cfg, "a", "r", "b", "s", &wts, &[]);
         assert!(plan.gh_rename && plan.gh_transfer);
         assert_eq!(plan.bare_to, PathBuf::from("/opt/dev/b/s.git"));
         assert_eq!(
@@ -1095,5 +1312,195 @@ mod tests {
             "Repositories cannot be transferred to the original owner"
         ));
         assert!(!transfer_blocked_needs_mirror_fallback("HTTP 401"));
+    }
+
+    #[test]
+    fn remap_under_relocated_dir_rewrites_paths_inside_the_old_bare() {
+        let from = Path::new("/opt/dev/a/r.git");
+        let to = Path::new("/opt/dev/b/s.git");
+        assert_eq!(
+            remap_under_relocated_dir("/opt/dev/a/r.git/stokd-hooks", from, to),
+            Some("/opt/dev/b/s.git/stokd-hooks".to_string())
+        );
+        assert_eq!(
+            remap_under_relocated_dir("/opt/dev/a/r.git", from, to),
+            Some("/opt/dev/b/s.git".to_string())
+        );
+    }
+
+    #[test]
+    fn remap_under_relocated_dir_leaves_foreign_hook_dirs_alone() {
+        let from = Path::new("/opt/dev/a/r.git");
+        let to = Path::new("/opt/dev/b/s.git");
+        // husky-style relative path, and another repo's absolute path.
+        assert_eq!(remap_under_relocated_dir(".husky/_", from, to), None);
+        assert_eq!(
+            remap_under_relocated_dir("/opt/dev/a/other.git/stokd-hooks", from, to),
+            None
+        );
+        // A sibling whose name merely starts with the same characters.
+        assert_eq!(
+            remap_under_relocated_dir("/opt/dev/a/r.git.bak/stokd-hooks", from, to),
+            None
+        );
+    }
+
+    #[test]
+    fn plan_repo_rename_relocates_unregistered_strays_only() {
+        let cfg = RepositoriesConfig {
+            bare_root: "/opt/dev".into(),
+            worktree_root: "/opt/worktrees".into(),
+            main_worktree_name: "{branch}".into(),
+            track_non_git_workspaces: false,
+            ..Default::default()
+        };
+        let registered = vec![PathBuf::from("/opt/worktrees/a/r/main")];
+        let entries = vec![
+            PathBuf::from("/opt/worktrees/a/r/main"),
+            PathBuf::from("/opt/worktrees/a/r/stray"),
+        ];
+        let plan = plan_repo_rename(&cfg, "a", "r", "b", "s", &registered, &entries);
+
+        assert_eq!(
+            plan.stray_moves,
+            vec![(
+                PathBuf::from("/opt/worktrees/a/r/stray"),
+                PathBuf::from("/opt/worktrees/b/s/stray")
+            )],
+            "registered worktrees must not be planned as strays"
+        );
+        assert_eq!(
+            plan.old_worktree_prefix,
+            PathBuf::from("/opt/worktrees/a/r")
+        );
+    }
+
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn git_must(dir: &Path, args: &[&str]) {
+        let _ = git_out(dir, args);
+    }
+
+    #[test]
+    fn rename_preserves_hooks_wiring_and_relocates_stray_clone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = normalize_path(tmp.path());
+        let bare_root = root.join("dev");
+        let worktree_root = root.join("worktrees");
+        fs::create_dir_all(&bare_root).unwrap();
+        fs::create_dir_all(worktree_root.join("a").join("r")).unwrap();
+
+        // Seed repo -> bare hub at <bareRoot>/a/r.git.
+        let seed = root.join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        git_must(&root, &["init", "-q", "-b", "main", seed.to_str().unwrap()]);
+        fs::write(seed.join("f.txt"), "hello\n").unwrap();
+        git_must(&seed, &["add", "."]);
+        git_must(
+            &seed,
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+        );
+        let bare = bare_root.join("a").join("r.git");
+        fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        git_must(
+            &root,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                seed.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+
+        // Hook wiring that lives INSIDE the bare — the thing a rename drops.
+        let hooks = bare.join("stokd-hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        fs::write(hooks.join("commit-msg"), "#!/bin/sh\nexit 0\n").unwrap();
+        git_must(
+            &bare,
+            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
+
+        // One registered linked worktree, and one standalone clone parked
+        // alongside it that git knows nothing about.
+        let wt = worktree_root.join("a").join("r").join("main");
+        git_must(
+            &bare,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "main"],
+        );
+        let stray = worktree_root.join("a").join("r").join("stray");
+        git_must(
+            &root,
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                stray.to_str().unwrap(),
+            ],
+        );
+        git_must(
+            &stray,
+            &["remote", "set-url", "origin", "git@github.com:a/r.git"],
+        );
+
+        let cfg = RepositoriesConfig {
+            bare_root: bare_root.to_string_lossy().into_owned(),
+            worktree_root: worktree_root.to_string_lossy().into_owned(),
+            main_worktree_name: "{branch}".into(),
+            track_non_git_workspaces: false,
+            ..Default::default()
+        };
+        run_rename_local_layout_only(&cfg, "a", "r", "b", "s");
+
+        // 1. Hook wiring survives and resolves.
+        let new_bare = bare_root.join("b").join("s.git");
+        let configured =
+            git_config_value(&new_bare, "core.hooksPath").expect("core.hooksPath still configured");
+        assert_eq!(
+            Path::new(&configured),
+            new_bare.join("stokd-hooks"),
+            "hooksPath must follow the bare"
+        );
+        assert!(
+            Path::new(&configured).is_dir(),
+            "hooksPath must resolve on disk: {configured}"
+        );
+
+        // 2. Nothing is left under the old owner/repo prefix.
+        let moved_stray = worktree_root.join("b").join("s").join("stray");
+        assert!(moved_stray.is_dir(), "stray clone must be relocated");
+        assert!(
+            !worktree_root.join("a").join("r").exists(),
+            "old worktree prefix must be gone"
+        );
+
+        // 3. The relocated clone names the new repo.
+        assert_eq!(
+            git_config_value(&moved_stray, "remote.origin.url").as_deref(),
+            Some("git@github.com:b/s.git")
+        );
     }
 }
