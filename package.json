@@ -1,0 +1,14 @@
+{
+  "name": "sgit",
+  "private": true,
+  "description": "sgit CLI + static site deploy for sgit.selfactor.io",
+  "packageManager": "pnpm@10.33.3",
+  "scripts": {
+    "done": "bash scripts/done.sh prod",
+    "done:prod": "bash scripts/done.sh prod",
+    "done:stage": "bash scripts/done.sh stage",
+    "done:local": "bash scripts/done.sh local",
+    "done:plan": "STOKD_DONE_DRY_RUN=1 bash scripts/done.sh prod",
+    "done:force": "STOKD_DONE_FORCE=1 bash scripts/done.sh prod"
+  }
+}

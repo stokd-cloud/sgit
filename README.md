@@ -259,6 +259,9 @@ sgit/
     sgit/                 # CLI binary
     sgit-graph/           # graph engine + GraphStore trait
     sgit-graph-mongo/     # optional Mongo backend
+  site/                   # static public site (sgit.selfactor.io)
+  terraform/              # reusable module + live/ standalone root
+  package.json            # pnpm done / done:prod / done:stage / done:local / done:plan
 ```
 
 Full crate export lands in a follow-on extraction; this bootstrap keeps a clean public home with MIT license and docs.
@@ -271,6 +274,75 @@ Full crate export lands in a follow-on extraction; this bootstrap keeps a clean 
 cargo test --workspace
 cargo build -p sgit -p sgit-core
 ```
+
+## Deploy (`sgit.selfactor.io`)
+
+This repo is CLI-first. There is no web/UI crate. The first deployable is a static public site (install + docs from this README) at **https://sgit.selfactor.io**.
+
+From this directory, after AWS credentials and DNS vars are set:
+
+```bash
+pnpm done          # terraform apply, prod (sgit.selfactor.io)
+pnpm done:prod     # same as done
+pnpm done:stage    # terraform apply, stage (sgit-stage.selfactor.io)
+pnpm done:plan     # terraform plan (STOKD_DONE_DRY_RUN=1)
+pnpm done:force    # apply -auto-approve
+pnpm done:local    # serve ./site locally; no AWS apply
+```
+
+`done` / `done:prod` / `done:stage` run `terraform init` then `apply` for that environment. They do not reproduce the full mono `scripts/done.sh`.
+
+The GitHub repository can stay private. The site is a static snapshot in `site/` and does not fetch from GitHub at request time. If `assets/logo.svg` is present (see PR #19), `scripts/build-site.sh` copies it into the site; otherwise the image is omitted.
+
+### Required AWS / DNS vars
+
+`sgit.selfactor.io` is a subdomain of `selfactor.io`. Use the **existing** Route53 hosted zone — do not create a second zone.
+
+| Variable | Purpose |
+|----------|---------|
+| `SGIT_HOSTED_ZONE_ID` | Hosted zone ID for `selfactor.io` (already in the SST account) |
+| `SGIT_AWS_REGION` | AWS region for S3 (default `us-east-1`) |
+| `SGIT_AWS_ACCOUNT_ID` | Optional. Fail apply if credentials are for another account |
+| `SGIT_DOMAIN` | Optional FQDN override |
+| `TF_STATE_BUCKET` | S3 bucket for Terraform state |
+| `TF_STATE_KEY` | State key (default `sgit/<env>/terraform.tfstate`) |
+| `TF_STATE_LOCK_TABLE` | DynamoDB lock table |
+| `TF_STATE_REGION` | State bucket region (default `us-east-1`) |
+
+Alternatively copy `terraform/live/backend.hcl.example` → `terraform/live/backend.hcl` and `terraform/live/terraform.tfvars.example` → `terraform/live/terraform.tfvars` (both gitignored).
+
+The ACM certificate is issued in **us-east-1** (CloudFront requirement) and validated via DNS records in `SGIT_HOSTED_ZONE_ID`.
+
+Remote state is S3 + DynamoDB so it can later move into a mono workspace. This repo does not create the state bucket or lock table.
+
+`pnpm done:local` is a no-AWS preview (`python3 -m http.server` on port 4173).
+
+If credentials or the hosted zone are unavailable, `pnpm done:plan` still runs `terraform validate` and skips a remote plan. Do not fake an apply.
+
+### Terraform layout (later mono roll-in)
+
+- [`terraform/`](terraform/) is the reusable module (`variables` in, `outputs` out).
+- [`terraform/live/`](terraform/live/) is the standalone root used by `pnpm done`.
+
+When [stokd-cloud/mono](https://github.com/stokd-cloud/mono) is converted from SST to Terraform, consume this stack without a rewrite:
+
+```hcl
+module "sgit" {
+  source = "./apps/sgit/terraform"
+
+  providers = {
+    aws           = aws
+    aws.us_east_1 = aws.us_east_1
+  }
+
+  hosted_zone_id  = var.selfactor_hosted_zone_id
+  domain_name     = "sgit.selfactor.io"
+  environment     = "prod"
+  site_source_dir = "${path.root}/apps/sgit/site"
+}
+```
+
+Details: [`terraform/README.md`](terraform/README.md).
 
 ## License
 

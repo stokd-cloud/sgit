@@ -1,0 +1,160 @@
+:root {
+  --bg: #f4f1ea;
+  --ink: #1a1916;
+  --muted: #5c574e;
+  --rule: #d4cfc4;
+  --code-bg: #ece8df;
+  --link: #1f4d3a;
+  --max: 40rem;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  font-size: 18px;
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  background: var(--bg);
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  line-height: 1.55;
+}
+
+.hero,
+main,
+footer {
+  width: min(var(--max), calc(100% - 2.5rem));
+  margin-inline: auto;
+}
+
+.hero {
+  padding: 4rem 0 2rem;
+}
+
+.logo {
+  display: block;
+  width: 96px;
+  height: 96px;
+  margin-bottom: 1.25rem;
+}
+
+h1 {
+  font-size: 2.4rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin: 0 0 0.6rem;
+}
+
+h2 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin: 0 0 0.75rem;
+}
+
+.lede {
+  font-size: 1.1rem;
+  margin: 0 0 0.75rem;
+}
+
+.meta,
+footer {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.meta {
+  margin: 0;
+}
+
+main {
+  padding-bottom: 3rem;
+}
+
+section {
+  padding: 1.5rem 0;
+  border-top: 1px solid var(--rule);
+}
+
+p,
+ul {
+  margin: 0 0 0.9rem;
+}
+
+ul {
+  padding-left: 1.2rem;
+}
+
+li + li {
+  margin-top: 0.35rem;
+}
+
+a {
+  color: var(--link);
+}
+
+code,
+pre {
+  font-family: ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+}
+
+pre {
+  background: var(--code-bg);
+  padding: 0.9rem 1rem;
+  overflow-x: auto;
+  margin: 0 0 0.9rem;
+}
+
+pre code {
+  font-size: inherit;
+}
+
+p code,
+li code,
+td code,
+h2 code {
+  background: var(--code-bg);
+  padding: 0.08em 0.3em;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95rem;
+  margin-bottom: 0.9rem;
+}
+
+th,
+td {
+  text-align: left;
+  vertical-align: top;
+  padding: 0.45rem 0.6rem 0.45rem 0;
+  border-top: 1px solid var(--rule);
+}
+
+th {
+  font-weight: 600;
+}
+
+footer {
+  padding: 0 0 3rem;
+  border-top: 1px solid var(--rule);
+}
+
+footer p {
+  margin: 1rem 0 0;
+}
+
+@media (max-width: 640px) {
+  html {
+    font-size: 16px;
+  }
+
+  .hero {
+    padding-top: 2.5rem;
+  }
+}

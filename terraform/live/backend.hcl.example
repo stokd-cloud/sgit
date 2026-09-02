@@ -1,0 +1,9 @@
+# Copy to backend.hcl (gitignored) or set TF_STATE_* env vars.
+# Bucket and DynamoDB table are expected to already exist (or be created
+# once by whoever owns org Terraform state). This stack does not create them.
+
+bucket         = "stokd-terraform-state"
+key            = "sgit/prod/terraform.tfstate"
+region         = "us-east-1"
+dynamodb_table = "stokd-terraform-locks"
+encrypt        = true

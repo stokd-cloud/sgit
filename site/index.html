@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sgit — git / worktree CLI</title>
+  <meta name="description" content="Standalone git / worktree CLI with a local knowledge graph. No stokd account required.">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="logo.svg" type="image/svg+xml">
+</head>
+<body>
+  <header class="hero">
+    <img class="logo" src="logo.svg" alt="" width="96" height="96" onerror="this.remove()">
+    <h1>sgit</h1>
+    <p class="lede">Standalone <strong>git / worktree CLI</strong> with a <strong>local knowledge graph</strong> — no stokd account required.</p>
+    <p class="meta">MIT &nbsp;·&nbsp; <a href="https://github.com/stokd-cloud/sgit">github.com/stokd-cloud/sgit</a></p>
+  </header>
+
+  <main>
+    <section id="install">
+      <h2>Install</h2>
+      <p>From source with Cargo. The published site does not depend on the GitHub repository being public.</p>
+      <pre><code>git clone https://github.com/stokd-cloud/sgit.git
+cd sgit
+cargo install --path crates/sgit</code></pre>
+      <p>Once published on crates.io:</p>
+      <pre><code>cargo install sgit</code></pre>
+      <p>Ensure <code>~/.cargo/bin</code> is on your <code>PATH</code>.</p>
+      <p>A pure sgit install needs only this repo (or a release binary) — no mono checkout and no stokd credentials. When using the stokd installer surface, <code>sgit</code> is also shipped alongside stokd tooling.</p>
+    </section>
+
+    <section id="scd">
+      <h2><code>scd</code> and <code>sgit cd</code></h2>
+      <p><code>sgit cd</code> resolves a repo (or worktree) and prints the path to <code>cd</code> into:</p>
+      <pre><code>sgit cd owner/repo
+sgit cd owner/repo main
+sgit cd my-repo</code></pre>
+      <p>Shell helper <code>scd</code> — source a small function that runs <code>sgit cd</code> and <code>cd</code>s for you:</p>
+      <pre><code># ~/.zshrc or ~/.bashrc
+scd() {
+  local target
+  target="$(sgit cd "$@")" || return $?
+  cd "$target" || return $?
+}</code></pre>
+      <pre><code>scd owner/repo
+scd owner/repo feature-branch</code></pre>
+    </section>
+
+    <section id="checkout">
+      <h2><code>sgit checkout &lt;branch&gt;</code></h2>
+      <p>Branch/worktree navigation for the repository containing the current directory. It must be run from inside a Git worktree. Every target is a branch name, including names containing <code>/</code>.</p>
+      <p>It never switches the current worktree's branch in place. Instead it reuses an existing linked worktree already on <code>&lt;branch&gt;</code>, or creates a new sibling worktree, then prints the absolute path.</p>
+      <pre><code># From any worktree of the repo (e.g. main):
+sgit checkout feature/login   # → /opt/worktrees/owner/repo/feature-login
+sgit checkout main            # reuses the existing main worktree</code></pre>
+      <p>Use the explicit repository commands when the target is a repository:</p>
+      <pre><code>sgit clone stokd-cloud/sgit
+sgit open sgit
+sgit create stokd-cloud/new-repo</code></pre>
+    </section>
+
+    <section id="repos">
+      <h2>Repo lifecycle</h2>
+      <p><code>clone</code>, <code>open</code>, and <code>create</code> are top-level verbs:</p>
+      <pre><code>sgit clone owner/repo        # bare clone + main worktree
+sgit clone repo              # owner resolved automatically
+sgit open repo               # clone if needed, then open in your editor
+sgit create repo             # create on GitHub under your account + local layout</code></pre>
+      <p>A bare repo name is resolved only when the owner is unambiguous (local layout first, then your GitHub owners). Remaining lifecycle verbs stay under the group: <code>sgit repo list</code>, <code>sgit repo rename</code>, <code>sgit repo migrate</code>.</p>
+    </section>
+
+    <section id="pull">
+      <h2><code>sgit pull</code></h2>
+      <p>Walks strategies in order of increasing cost: fast-forward, then rebase, then merge. A conflicted rebase is aborted and retried as a merge.</p>
+      <pre><code>sgit pull              # ff → rebase → merge
+sgit pull --ff-only    # refuse to escalate; fail instead
+sgit pull --no-rebase  # ff → merge, skipping the rebase rung</code></pre>
+      <ul>
+        <li>Missing upstream is set for you when <code>origin/&lt;branch&gt;</code> exists.</li>
+        <li>Both sides are snapshotted before escalation.</li>
+        <li>Never stashes. A dirty tracked working tree is a hard refusal.</li>
+      </ul>
+    </section>
+
+    <section id="graph">
+      <h2>Local knowledge graph</h2>
+      <p>Local-first. Data lives under your control (default file store under <code>~/.sgit/graph/…</code>, or optional Mongo). No stokd account is required.</p>
+      <pre><code>sgit graph scan --json
+sgit graph scan --all --dry-run --json
+sgit graph show owner/repo --json
+sgit graph query '&lt;expr&gt;'
+sgit graph config</code></pre>
+    </section>
+
+    <section id="stokd">
+      <h2>Relation to stokd</h2>
+      <table>
+        <thead>
+          <tr><th>Concern</th><th>Owner</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>sgit</code> binary, <code>scd</code> / <code>sgit cd</code>, local graph scan/query</td>
+            <td>This public product</td>
+          </tr>
+          <tr>
+            <td>Org graph UI, multi-tenant API, land hooks</td>
+            <td>stokd (optional cloud plane)</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>Day-to-day second-brain and offline workflows stay on sgit alone.</p>
+    </section>
+  </main>
+
+  <footer>
+    <p>MIT license. Site hosted at <a href="https://sgit.selfactor.io">sgit.selfactor.io</a>.</p>
+  </footer>
+</body>
+</html>
