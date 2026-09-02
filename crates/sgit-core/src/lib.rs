@@ -54,8 +54,8 @@ pub use layout::{
     run_git_dir, same_path, worktree_dir_for_branch, BARE_PLACEHOLDER_HEAD, RepoLayout,
 };
 pub use migrate_ops::{
-    materialize_main_worktree, move_bare, move_worktree, ApplyStatus, UnsafeReason,
-    WorktreeRepairTarget,
+    materialize_main_worktree, move_bare, move_linked_worktree_preserving_state, move_worktree,
+    ApplyStatus, LinkedWorktreeMove, UnsafeReason, WorktreeRepairTarget,
 };
 pub use repo_list::{list_bare_repos, BareRepoEntry};
 pub use repo_ref::{
