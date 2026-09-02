@@ -219,8 +219,11 @@ enum WorktreeCommands {
         #[arg(long)]
         all: bool,
         /// Remove pin markers instead of installing
-        #[arg(long)]
+        #[arg(long, conflicts_with = "status")]
         off: bool,
+        /// Read-only audit: report pin state per worktree, mutate nothing
+        #[arg(long)]
+        status: bool,
         /// Emit JSON
         #[arg(long)]
         json: bool,
@@ -292,8 +295,20 @@ fn main() {
             command: WorktreeCommands::Clean { dry_run },
         } => commands::worktree::run_clean(dry_run),
         Commands::Worktree {
-            command: WorktreeCommands::Pin { all, off, json },
-        } => commands::worktree::run_pin(all, off, json),
+            command:
+                WorktreeCommands::Pin {
+                    all,
+                    off,
+                    status,
+                    json,
+                },
+        } => {
+            if status {
+                commands::worktree::run_pin_status(all, json)
+            } else {
+                commands::worktree::run_pin(all, off, json)
+            }
+        }
         Commands::Worktree {
             command:
                 WorktreeCommands::Lock {
