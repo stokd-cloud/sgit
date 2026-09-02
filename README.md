@@ -1,3 +1,5 @@
+<img src="assets/logo.svg" alt="sgit" width="120" height="120">
+
 # sgit
 
 Standalone **git / worktree CLI** with a **local knowledge graph** — no stokd account required.
