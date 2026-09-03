@@ -60,10 +60,7 @@ impl WorktreeRepairTarget {
     }
 
     pub fn broken(path: PathBuf) -> Self {
-        Self {
-            path,
-            broken: true,
-        }
+        Self { path, broken: true }
     }
 }
 
@@ -125,50 +122,67 @@ pub fn move_linked_worktree_preserving_state(
     from: &Path,
     to: &Path,
 ) -> LinkedWorktreeMove {
-    if to.exists() {
-        return LinkedWorktreeMove::FailedUnchanged(format!(
-            "destination already exists: {}",
-            to.display()
-        ));
-    }
+    move_linked_worktree_preserving_state_with(
+        common_git_dir,
+        from,
+        to,
+        same_filesystem,
+        run_git_worktree_move,
+        rename_noreplace,
+    )
+}
 
-    let output = Command::new("git")
-        .arg("--git-dir")
-        .arg(common_git_dir)
-        .args(["worktree", "move"])
-        .arg(from)
-        .arg(to)
-        .output();
-    let failure = match output {
-        Ok(output) if output.status.success() => return LinkedWorktreeMove::MovedByGit,
-        Ok(output) => format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stderr).trim(),
-            String::from_utf8_lossy(&output.stdout).trim()
-        ),
-        Err(error) => {
+fn move_linked_worktree_preserving_state_with<FilesystemCheck, GitMove, Rename>(
+    common_git_dir: &Path,
+    from: &Path,
+    to: &Path,
+    filesystem_check: FilesystemCheck,
+    git_move: GitMove,
+    rename: Rename,
+) -> LinkedWorktreeMove
+where
+    FilesystemCheck: Fn(&Path, &Path) -> Result<bool, String>,
+    GitMove: Fn(&Path, &Path, &Path) -> Result<(), String>,
+    Rename: Fn(&Path, &Path) -> std::io::Result<()>,
+{
+    match destination_occupied(to) {
+        Ok(true) => {
             return LinkedWorktreeMove::FailedUnchanged(format!(
-                "git worktree move failed to start: {error}"
+                "destination already exists: {}",
+                to.display()
             ))
         }
-    };
-
-    if !is_submodule_move_refusal(&failure) {
-        return LinkedWorktreeMove::FailedUnchanged(failure.trim().to_string());
+        Ok(false) => {}
+        Err(error) => return LinkedWorktreeMove::FailedUnchanged(error),
     }
 
-    match same_filesystem(from, to) {
+    // This is deliberately before `git worktree move`: adoption is a
+    // same-filesystem topology rename even when Git could implement something
+    // broader. Refusing here also proves no Git/admin mutation happened.
+    match filesystem_check(from, to) {
         Ok(true) => {}
         Ok(false) => {
             return LinkedWorktreeMove::FailedUnchanged(
-                "submodule fallback requires source and destination on the same filesystem"
+                "worktree adoption requires source and destination on the same filesystem"
                     .to_string(),
             )
         }
         Err(error) => return LinkedWorktreeMove::FailedUnchanged(error),
     }
 
-    let nested_admins = discover_nested_git_admins(from);
+    let failure = match git_move(common_git_dir, from, to) {
+        Ok(()) => return LinkedWorktreeMove::MovedByGit,
+        Err(failure) => failure,
+    };
+
+    if !is_submodule_move_refusal(&failure) {
+        return LinkedWorktreeMove::FailedUnchanged(failure.trim().to_string());
+    }
+
+    let nested_admins = match discover_nested_git_admins(from) {
+        Ok(admins) => admins,
+        Err(error) => return LinkedWorktreeMove::FailedUnchanged(error),
+    };
     if let Some(parent) = to.parent() {
         if let Err(error) = fs::create_dir_all(parent) {
             return LinkedWorktreeMove::FailedUnchanged(format!(
@@ -177,9 +191,23 @@ pub fn move_linked_worktree_preserving_state(
             ));
         }
     }
-    if let Err(error) = fs::rename(from, to) {
+
+    // Re-attest immediately before the raw rename. The rename primitive is
+    // itself exclusive, so a destination created after this check still wins
+    // without being replaced.
+    match destination_occupied(to) {
+        Ok(true) => {
+            return LinkedWorktreeMove::FailedUnchanged(format!(
+                "destination appeared before fallback rename: {}",
+                to.display()
+            ))
+        }
+        Ok(false) => {}
+        Err(error) => return LinkedWorktreeMove::FailedUnchanged(error),
+    }
+    if let Err(error) = rename(from, to) {
         return LinkedWorktreeMove::FailedUnchanged(format!(
-            "same-filesystem worktree rename failed: {error}"
+            "same-filesystem exclusive worktree rename failed: {error}"
         ));
     }
 
@@ -188,6 +216,105 @@ pub fn move_linked_worktree_preserving_state(
     }
 
     LinkedWorktreeMove::MovedByRenameRepair
+}
+
+fn run_git_worktree_move(common_git_dir: &Path, from: &Path, to: &Path) -> Result<(), String> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(common_git_dir)
+        .args(["worktree", "move"])
+        .arg(from)
+        .arg(to)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+            String::from_utf8_lossy(&output.stdout).trim()
+        )),
+        Err(error) => Err(format!("git worktree move failed to start: {error}")),
+    }
+}
+
+fn destination_occupied(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "cannot inspect destination {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in source path"))?;
+    let to = CString::new(to.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in destination path")
+    })?;
+    // SAFETY: both arguments are live NUL-terminated path buffers, and
+    // RENAME_EXCL asks the kernel to fail atomically if `to` exists.
+    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in source path"))?;
+    let to = CString::new(to.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in destination path")
+    })?;
+    // SAFETY: arguments are valid C paths. renameat2 with RENAME_NOREPLACE is
+    // one kernel transaction and cannot overwrite a racing destination.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    // Windows' rename primitive refuses an existing destination when no
+    // replacement flag is supplied.
+    fs::rename(from, to)
+}
+
+#[cfg(all(
+    unix,
+    not(target_os = "macos"),
+    not(target_os = "linux"),
+    not(target_os = "android")
+))]
+fn rename_noreplace(_from: &Path, _to: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "this platform has no configured atomic no-replace directory rename",
+    ))
 }
 
 fn is_submodule_move_refusal(message: &str) -> bool {
@@ -264,49 +391,96 @@ struct NestedGitAdmin {
     git_dir: PathBuf,
 }
 
-fn discover_nested_git_admins(root: &Path) -> Vec<NestedGitAdmin> {
-    fn visit(root: &Path, current: &Path, out: &mut Vec<NestedGitAdmin>) {
-        let Ok(entries) = fs::read_dir(current) else {
-            return;
-        };
-        for entry in entries.flatten() {
+fn discover_nested_git_admins(root: &Path) -> Result<Vec<NestedGitAdmin>, String> {
+    fn visit(root: &Path, current: &Path, out: &mut Vec<NestedGitAdmin>) -> Result<(), String> {
+        let entries = fs::read_dir(current).map_err(|error| {
+            format!(
+                "cannot scan nested Git roots in {}: {error}",
+                current.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "cannot read nested Git entry in {}: {error}",
+                    current.display()
+                )
+            })?;
             let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
+            if entry.file_name() == ".git" {
                 continue;
-            };
+            }
+            let file_type = entry.file_type().map_err(|error| {
+                format!(
+                    "cannot inspect nested Git entry {}: {error}",
+                    path.display()
+                )
+            })?;
             if !file_type.is_dir() || file_type.is_symlink() {
                 continue;
             }
             let marker = path.join(".git");
-            if marker.exists() {
+            let has_marker = match fs::symlink_metadata(&marker) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(format!(
+                        "cannot inspect nested Git marker {}: {error}",
+                        marker.display()
+                    ))
+                }
+            };
+            if has_marker {
                 let output = Command::new("git")
                     .arg("-C")
                     .arg(&path)
                     .args(["rev-parse", "--path-format=absolute", "--git-dir"])
-                    .output();
-                if let Ok(output) = output {
-                    if output.status.success() {
-                        let git_dir = PathBuf::from(
-                            String::from_utf8_lossy(&output.stdout).trim().to_string(),
-                        );
-                        if let Ok(relative_root) = path.strip_prefix(root) {
-                            out.push(NestedGitAdmin {
-                                relative_root: relative_root.to_path_buf(),
-                                git_dir,
-                            });
-                        }
-                    }
+                    .output()
+                    .map_err(|error| {
+                        format!(
+                            "cannot resolve nested Git admin for {}: {error}",
+                            path.display()
+                        )
+                    })?;
+                if !output.status.success() {
+                    return Err(format!(
+                        "cannot resolve nested Git admin for {}: {}",
+                        path.display(),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
                 }
-                continue;
+                let git_dir =
+                    PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+                let relative_root = path.strip_prefix(root).map_err(|error| {
+                    format!(
+                        "nested Git root {} escaped {}: {error}",
+                        path.display(),
+                        root.display()
+                    )
+                })?;
+                out.push(NestedGitAdmin {
+                    relative_root: relative_root.to_path_buf(),
+                    git_dir,
+                });
             }
-            visit(root, &path, out);
+            // Initialized submodules may themselves contain initialized
+            // submodules. Recurse through their worktree, skipping only the
+            // `.git` marker/admin entry above.
+            visit(root, &path, out)?;
         }
+        Ok(())
     }
 
     let mut out = Vec::new();
-    visit(root, root, &mut out);
-    out.sort_by(|left, right| left.relative_root.cmp(&right.relative_root));
-    out
+    visit(root, root, &mut out)?;
+    out.sort_by(|left, right| {
+        left.relative_root
+            .components()
+            .count()
+            .cmp(&right.relative_root.components().count())
+            .then_with(|| left.relative_root.cmp(&right.relative_root))
+    });
+    Ok(out)
 }
 
 fn repair_moved_worktree(
@@ -377,7 +551,25 @@ fn rollback_failed_fallback(
     nested_admins: &[NestedGitAdmin],
     repair_error: String,
 ) -> LinkedWorktreeMove {
-    if let Err(rollback_error) = fs::rename(to, from) {
+    match destination_occupied(from) {
+        Ok(true) => {
+            return LinkedWorktreeMove::RecoverableIncomplete {
+                current_path: to.to_path_buf(),
+                error: format!(
+                    "{repair_error}; rollback source path is occupied: {}",
+                    from.display()
+                ),
+            }
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return LinkedWorktreeMove::RecoverableIncomplete {
+                current_path: to.to_path_buf(),
+                error: format!("{repair_error}; rollback source inspection failed: {error}"),
+            }
+        }
+    }
+    if let Err(rollback_error) = rename_noreplace(to, from) {
         return LinkedWorktreeMove::RecoverableIncomplete {
             current_path: to.to_path_buf(),
             error: format!(
@@ -548,7 +740,10 @@ mod adoption_tests {
         );
 
         assert!(matches!(outcome, LinkedWorktreeMove::FailedUnchanged(_)));
-        assert!(!git_invoked.get(), "Git must not run before the device guard");
+        assert!(
+            !git_invoked.get(),
+            "Git must not run before the device guard"
+        );
         assert!(source.exists());
         assert!(!destination.exists());
     }
@@ -606,7 +801,10 @@ mod adoption_tests {
         );
 
         assert!(matches!(outcome, LinkedWorktreeMove::FailedUnchanged(_)));
-        assert_eq!(fs::read_to_string(source.join("source.txt")).unwrap(), "source\n");
+        assert_eq!(
+            fs::read_to_string(source.join("source.txt")).unwrap(),
+            "source\n"
+        );
         assert_eq!(
             fs::read_to_string(destination.join("winner.txt")).unwrap(),
             "racing destination\n"
@@ -671,10 +869,7 @@ mod adoption_tests {
             &nested_submodule,
             &["config", "user.email", "test@stokd.test"],
         );
-        git(
-            &nested_submodule,
-            &["config", "user.name", "Stokd Test"],
-        );
+        git(&nested_submodule, &["config", "user.name", "Stokd Test"]);
         fs::write(nested_submodule.join("grandchild.txt"), "grandchild\n").unwrap();
         git(&nested_submodule, &["add", "grandchild.txt"]);
         git(&nested_submodule, &["commit", "-qm", "grandchild"]);
@@ -764,7 +959,7 @@ mod adoption_tests {
         git(&nested_destination, &["status", "--porcelain=v2"]);
         assert_eq!(
             PathBuf::from(git(&nested_destination, &["rev-parse", "--show-toplevel"])),
-            nested_destination
+            fs::canonicalize(&nested_destination).unwrap()
         );
         let topology = git(&destination, &["worktree", "list", "--porcelain"]);
         assert!(topology.contains(destination.to_str().unwrap()));
